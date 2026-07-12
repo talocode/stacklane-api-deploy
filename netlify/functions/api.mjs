@@ -7,14 +7,32 @@ function loadDb() {
   try {
     return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
   } catch {
+    const now = new Date().toISOString()
     const db = {
       users: [
-        { id: 'user-admin-001', email: 'admin@stacklane.local', name: 'Admin', password: 'stacklane-admin', status: 'active', lastLoginAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        { id: 'user-admin-001', email: 'admin@stacklane.local', name: 'Admin', password: 'stacklane-admin', status: 'active', lastLoginAt: null, createdAt: now, updatedAt: now },
       ],
       sessions: {},
       api_keys: { 'sk-dev-talocode': 'user-admin-001' },
-      profiles: { 'user-admin-001': { purchased_credits_balance: 1000, free_plan_credits_used: 0 } },
+      project_api_keys: [],
+      profiles: { 'user-admin-001': { purchased_credits_balance: 10000, free_plan_credits_used: 0 } },
       usage_events: [],
+      regions: [
+        { id: 'reg-ng-lagos', code: 'ng-lagos', name: 'Lagos, Nigeria', marketScope: 'africa-west', deploymentTarget: 'africa-west1', isActive: true, createdAt: now, updatedAt: now },
+        { id: 'reg-us-east', code: 'us-east', name: 'US East (N. Virginia)', marketScope: 'global', deploymentTarget: 'us-east-1', isActive: true, createdAt: now, updatedAt: now },
+      ],
+      organizations: [
+        { id: 'org-talocode', name: 'Talocode', slug: 'talocode', status: 'active', createdAt: now, updatedAt: now },
+      ],
+      projects: [
+        { id: 'proj-tera-api', name: 'Tera API', slug: 'tera-api', status: 'ready', region: 'us-east', description: 'Talocode Tera API', organizationId: 'org-talocode', createdAt: now, updatedAt: now },
+      ],
+      environments: [],
+      provisioning_tasks: [],
+      provisioning_attempts: [],
+      audit_events: [],
+      wallets: { 'proj-tera-api': { id: 'wallet-tera', projectId: 'proj-tera-api', balance: 5000, lifetimeCredits: 5000, lifetimeSpend: 0, freeCreditsGranted: true, createdAt: now, updatedAt: now } },
+      transactions: [],
     }
     saveDb(db)
     return db
@@ -29,8 +47,16 @@ function makeToken() {
   return randomBytes(32).toString('hex')
 }
 
+function makeId(prefix) {
+  return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 12)}`
+}
+
 function makeRequestId() {
   return `sl_req_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+}
+
+function slugify(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
 
 function extractApiKey(headers) {
@@ -48,8 +74,18 @@ function extractSession(headers) {
   return null
 }
 
-function json(statusCode, data, extraHeaders) {
-  return { statusCode, headers: { 'Content-Type': 'application/json', ...extraHeaders }, body: JSON.stringify(data) }
+function authenticate(headers) {
+  const token = extractSession(headers)
+  if (!token) return null
+  const db = loadDb()
+  const session = db.sessions[token]
+  if (!session) return null
+  const user = db.users.find(u => u.id === session.userId)
+  return user || null
+}
+
+function jsonBody(body) {
+  try { return typeof body === 'string' ? JSON.parse(body) : body } catch { return null }
 }
 
 function corsHeaders(origin) {
@@ -63,11 +99,21 @@ function corsHeaders(origin) {
   }
 }
 
+function respond(status, data, extra) {
+  return { statusCode: status, headers: { 'Content-Type': 'application/json', ...(extra || {}) }, body: JSON.stringify(data) }
+}
+
 function withCors(result, origin) {
-  if (result && result.headers) {
-    Object.assign(result.headers, corsHeaders(origin))
-  }
+  if (result && result.headers) Object.assign(result.headers, corsHeaders(origin))
   return result
+}
+
+function ok(body, requestId) {
+  return { data: body, meta: { requestId } }
+}
+
+function fail(code, message, requestId) {
+  return { error: { code, message, requestId } }
 }
 
 function normalizePath(p) {
@@ -76,66 +122,55 @@ function normalizePath(p) {
   return p
 }
 
+function handleError(err, requestId, origin) {
+  return withCors(respond(503, fail('internal_error', err.message, requestId)), origin)
+}
+
 async function routeHandler(method, rawPath, headers, body) {
   const path = normalizePath(rawPath)
   const requestId = makeRequestId()
   const origin = headers['origin'] || headers['Origin'] || ''
 
-  function respond(status, data, extra) {
-    return withCors(json(status, data, extra), origin)
+  function r(status, data, extra) { return withCors(respond(status, data, extra), origin) }
+  function e(status, code, msg) { return r(status, fail(code, msg, requestId)) }
+  function requireAuth() {
+    const user = authenticate(headers)
+    if (!user) return null
+    return user
   }
 
-  function error(status, code, message) {
-    return withCors(json(status, { error: { code, message, requestId } }), origin)
+  if (method === 'OPTIONS') return withCors(respond(204, '', {}), origin)
+
+  // Health
+  if ((method === 'GET' || method === 'HEAD') && /^\/(health|\/api\/v1\/health)?$/.test(path)) {
+    return r(200, ok({ status: 'ok', service: 'stacklane-api', version: '0.5.0', timestamp: new Date().toISOString() }, requestId))
   }
 
-  if (method === 'OPTIONS') {
-    return withCors({ statusCode: 204, headers: {}, body: '' }, origin)
-  }
-
-  if ((method === 'GET' || method === 'HEAD') && (path === '/' || path === '' || path === '/health' || path === '/api/v1/health')) {
-    return respond(200, { status: 'ok', service: 'stacklane-api', version: '0.1.0', requestId, timestamp: new Date().toISOString() })
-  }
-
+  // Pricing
   if (method === 'GET' && path === '/api/v1/cloud/pricing') {
-    return respond(200, {
+    return r(200, ok({
       pricing: {
         tera_api: {
-          'chat.completions': 3,
-          'writing.rewrite': 5,
-          'writing.draft': 10,
-          'coding.explain': 10,
-          'coding.review': 20,
-          'coding.write': 20,
+          'chat.completions': 3, 'writing.rewrite': 5, 'writing.draft': 10,
+          'coding.explain': 10, 'coding.review': 20, 'coding.write': 20,
         },
       },
-      requestId,
-    })
+    }, requestId))
   }
 
   // ─── Auth ────────────────────────────────────────────────────────
 
   if (method === 'POST' && path === '/auth/login') {
-    let payload
-    try { payload = typeof body === 'string' ? JSON.parse(body) : body } catch {
-      return error(400, 'invalid_request', 'Invalid JSON body')
-    }
-    if (!payload.email || !payload.password) {
-      return error(400, 'invalid_request', 'email and password are required')
-    }
-
+    const payload = jsonBody(body)
+    if (!payload || !payload.email || !payload.password) return e(400, 'invalid_request', 'email and password are required')
     const db = loadDb()
     const user = db.users.find(u => u.email === payload.email)
-    if (!user || user.password !== payload.password) {
-      return error(401, 'invalid_credentials', 'Invalid email or password')
-    }
-
+    if (!user || user.password !== payload.password) return e(401, 'invalid_credentials', 'Invalid email or password')
     const token = makeToken()
     db.sessions[token] = { userId: user.id, createdAt: new Date().toISOString() }
     user.lastLoginAt = new Date().toISOString()
     saveDb(db)
-
-    const { password, ...safeUser } = user
+    const { password, ...safe } = user
     return withCors({
       statusCode: 200,
       headers: {
@@ -143,96 +178,399 @@ async function routeHandler(method, rawPath, headers, body) {
         'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400`,
         ...corsHeaders(origin),
       },
-      body: JSON.stringify({ data: safeUser, meta: { requestId } }),
+      body: JSON.stringify(ok(safe, requestId)),
     }, origin)
   }
 
   if (method === 'POST' && path === '/auth/logout') {
     const token = extractSession(headers)
-    if (token) {
-      const db = loadDb()
-      delete db.sessions[token]
-      saveDb(db)
-    }
+    if (token) { const db = loadDb(); delete db.sessions[token]; saveDb(db) }
     return withCors({
       statusCode: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Set-Cookie': `sl_session=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`,
+        'Set-Cookie': 'sl_session=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0',
         ...corsHeaders(origin),
       },
-      body: JSON.stringify({ data: { ok: true }, meta: { requestId } }),
+      body: JSON.stringify(ok({ ok: true }, requestId)),
     }, origin)
   }
 
   if (method === 'GET' && path === '/auth/me') {
-    const token = extractSession(headers)
-    if (!token) return error(401, 'not_authenticated', 'Not authenticated')
+    const user = requireAuth()
+    if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const { password, ...safe } = user
+    return r(200, ok(safe, requestId))
+  }
 
+  // ─── Regions ─────────────────────────────────────────────────────
+
+  if (method === 'GET' && path === '/regions') {
     const db = loadDb()
-    const session = db.sessions[token]
-    if (!session) return error(401, 'session_expired', 'Session expired')
-
-    const user = db.users.find(u => u.id === session.userId)
-    if (!user) return error(401, 'user_not_found', 'User not found')
-
-    const { password, ...safeUser } = user
-    return respond(200, { data: safeUser, meta: { requestId } })
+    return r(200, ok(db.regions, requestId))
   }
 
-  // ─── Existing endpoints ──────────────────────────────────────────
+  // ─── Organizations ───────────────────────────────────────────────
 
-  if (method !== 'POST') {
-    return error(404, 'not_found', `Not found: ${method} ${path}`)
+  const orgMatch = path.match(/^\/organizations(?:\/([^/]+))?(?:\/([^/]+))?$/)
+  const orgSlug = orgMatch ? orgMatch[1] : null
+  const orgSub = orgMatch ? orgMatch[2] : null
+
+  if (path === '/organizations' && method === 'GET') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    return r(200, ok(db.organizations, requestId))
   }
 
-  if (path === '/api/v1/cloud/usage/charge') {
+  if (path === '/organizations' && method === 'POST') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
+    const db = loadDb()
+    const org = { id: makeId('org'), name: payload.name, slug: payload.slug || slugify(payload.name), status: 'active', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+    db.organizations.push(org)
+    saveDb(db)
+    return r(200, ok(org, requestId))
+  }
+
+  // ─── Projects ────────────────────────────────────────────────────
+
+  const projMatch = path.match(/^\/projects(?:\/([^/]+))?(?:\/([^/]+))?(?:\/([^/]+))?(?:\/([^/]+))?$/)
+  const projSlug = projMatch ? projMatch[1] : null
+  const projRes = projMatch ? projMatch[2] : null
+  const projId3 = projMatch ? projMatch[3] : null
+  const projId4 = projMatch ? projMatch[4] : null
+
+  if (path === '/projects' && method === 'GET') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    return r(200, ok(db.projects, requestId))
+  }
+
+  if (path === '/projects' && method === 'POST') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
+    const db = loadDb()
+    const now = new Date().toISOString()
+    const proj = {
+      id: makeId('proj'), name: payload.name, slug: payload.slug || slugify(payload.name),
+      status: payload.status || 'provisioning', region: payload.region || 'us-east',
+      description: payload.description || '', organizationId: payload.organizationId || 'org-talocode',
+      createdAt: now, updatedAt: now,
+    }
+    db.projects.push(proj)
+    db.wallets[proj.id] = { id: makeId('wallet'), projectId: proj.id, balance: 0, lifetimeCredits: 0, lifetimeSpend: 0, freeCreditsGranted: false, createdAt: now, updatedAt: now }
+    saveDb(db)
+    return r(200, ok(proj, requestId))
+  }
+
+  // GET /projects/:slug
+  if (projSlug && !projRes && method === 'GET' && path === `/projects/${projSlug}`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const org = db.organizations.find(o => o.id === proj.organizationId)
+    const envs = db.environments.filter(e => e.projectId === proj.id)
+    return r(200, ok({ ...proj, organization: org || null, environments: envs, capabilities: { canManageProvisioning: true, canManageApiKeys: true, canManageEnvironments: true, canUpdateProject: true } }, requestId))
+  }
+
+  // PATCH /projects/:slug
+  if (projSlug && !projRes && method === 'PATCH' && path === `/projects/${projSlug}`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    if (payload.name) proj.name = payload.name
+    if (payload.status) proj.status = payload.status
+    if (payload.description !== undefined) proj.description = payload.description
+    proj.updatedAt = new Date().toISOString()
+    saveDb(db)
+    return r(200, ok(proj, requestId))
+  }
+
+  // POST /projects/:slug/provision
+  if (projRes === 'provision' && method === 'POST' && path === `/projects/${projSlug}/provision`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const now = new Date().toISOString()
+    const task = {
+      id: makeId('task'), projectId: proj.id, environmentId: null, region: db.regions.find(r => r.code === proj.region) || null,
+      status: 'running', source: 'manual', requestedByUserId: user.id, currentAttempt: 1, maxAttempts: 3,
+      lastError: null, diagnostics: {}, createdAt: now, updatedAt: now, startedAt: now, completedAt: null,
+      nextRunAt: now, claimedBy: null, claimedAt: null, claimExpiresAt: null, lastHeartbeatAt: null, lastTransitionAt: now,
+    }
+    db.provisioning_tasks.push(task)
+    proj.status = 'provisioning'
+    saveDb(db)
+    return r(200, ok(task, requestId))
+  }
+
+  // GET /projects/:slug/provisioning
+  if (projRes === 'provisioning' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/provisioning`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const task = db.provisioning_tasks.filter(t => t.projectId === proj.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] || null
+    const attempts = db.provisioning_attempts.filter(a => a.taskId === task?.id)
+    const runtimeBinding = task?.status === 'ready' ? { id: makeId('bind'), projectId: proj.id, regionId: proj.region, databaseRef: null, storageRef: null, authNamespaceRef: null, functionsNamespaceRef: null, status: 'ready', diagnostics: {}, createdAt: proj.createdAt, updatedAt: proj.updatedAt } : null
+    return r(200, ok({ task, attempts: attempts || [], runtimeBinding, capabilities: { canManageProvisioning: true, canManageApiKeys: true, canManageEnvironments: true, canUpdateProject: true } }, requestId))
+  }
+
+  // GET /projects/:slug/provisioning/tasks
+  if (projRes === 'provisioning' && projId3 === 'tasks' && !projId4 && method === 'GET') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    return r(200, ok(db.provisioning_tasks.filter(t => t.projectId === proj.id), requestId))
+  }
+
+  // POST /projects/:slug/provisioning/retry
+  if (projRes === 'provisioning' && projId3 === 'retry' && !projId4 && method === 'POST') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const now = new Date().toISOString()
+    const task = {
+      id: makeId('task'), projectId: proj.id, environmentId: null, region: db.regions.find(r => r.code === proj.region),
+      status: 'running', source: 'retry', requestedByUserId: user.id, currentAttempt: 1, maxAttempts: 3,
+      lastError: null, diagnostics: {}, createdAt: now, updatedAt: now, startedAt: now, completedAt: null,
+      nextRunAt: now, claimedBy: null, claimedAt: null, claimExpiresAt: null, lastHeartbeatAt: null, lastTransitionAt: now,
+    }
+    db.provisioning_tasks.push(task)
+    proj.status = 'provisioning'
+    saveDb(db)
+    return r(200, ok(task, requestId))
+  }
+
+  // GET /projects/:slug/events
+  if (projRes === 'events' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/events`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    return r(200, ok(db.audit_events.filter(e => e.projectId === proj.id), requestId))
+  }
+
+  // GET /projects/:slug/api-keys
+  if (projRes === 'api-keys' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/api-keys`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    return r(200, ok(db.project_api_keys.filter(k => k.projectId === proj.id), requestId))
+  }
+
+  // POST /projects/:slug/api-keys
+  if (projRes === 'api-keys' && !projId3 && method === 'POST' && path === `/projects/${projSlug}/api-keys`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const now = new Date().toISOString()
+    const keyObj = {
+      id: makeId('key'), projectId: proj.id, organizationId: proj.organizationId,
+      name: payload.name, prefix: 'sk_lane_dev_', status: 'active',
+      revokedAt: null, lastUsedAt: null, createdAt: now, updatedAt: now,
+    }
+    const secret = `sk_lane_dev_${makeToken()}`
+    db.project_api_keys.push(keyObj)
+    saveDb(db)
+    return r(200, ok({ key: keyObj, secret }, requestId))
+  }
+
+  // POST /projects/:slug/api-keys/:keyId/revoke
+  if (projRes === 'api-keys' && projId3 && projId4 === 'revoke' && method === 'POST') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const key = db.project_api_keys.find(k => k.id === projId3 && k.projectId === proj.id)
+    if (!key) return e(404, 'not_found', 'API key not found')
+    key.status = 'revoked'
+    key.revokedAt = new Date().toISOString()
+    saveDb(db)
+    return r(200, ok(key, requestId))
+  }
+
+  // GET /projects/:slug/environments
+  if (projRes === 'environments' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/environments`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    return r(200, ok(db.environments.filter(e => e.projectId === proj.id), requestId))
+  }
+
+  // POST /projects/:slug/environments
+  if (projRes === 'environments' && !projId3 && method === 'POST' && path === `/projects/${projSlug}/environments`) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const now = new Date().toISOString()
+    const env = {
+      id: makeId('env'), projectId: proj.id, name: payload.name, slug: payload.slug || slugify(payload.name),
+      status: payload.status || 'ready', region: payload.region || proj.region,
+      deploymentTarget: payload.deploymentTarget || 'africa-west1', createdAt: now, updatedAt: now,
+    }
+    db.environments.push(env)
+    saveDb(db)
+    return r(200, ok(env, requestId))
+  }
+
+  // PATCH /projects/:slug/environments/:envId
+  if (projRes === 'environments' && projId3 && !projId4 && method === 'PATCH') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    const db = loadDb()
+    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    if (!proj) return e(404, 'not_found', 'Project not found')
+    const env = db.environments.find(e => e.id === projId3 && e.projectId === proj.id)
+    if (!env) return e(404, 'not_found', 'Environment not found')
+    if (payload.status) env.status = payload.status
+    if (payload.region) env.region = payload.region
+    if (payload.deploymentTarget) env.deploymentTarget = payload.deploymentTarget
+    env.updatedAt = new Date().toISOString()
+    saveDb(db)
+    return r(200, ok(env, requestId))
+  }
+
+  // ─── Organization sub-resources ──────────────────────────────────
+
+  // GET /organizations/:slug/projects
+  if (orgSlug && orgSub === 'projects' && method === 'GET') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const org = db.organizations.find(o => o.id === orgSlug || o.slug === orgSlug)
+    if (!org) return e(404, 'not_found', 'Organization not found')
+    return r(200, ok(db.projects.filter(p => p.organizationId === org.id), requestId))
+  }
+
+  // GET /organizations/:slug/operations
+  if (orgSlug && orgSub === 'operations' && method === 'GET') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = loadDb()
+    const org = db.organizations.find(o => o.id === orgSlug || o.slug === orgSlug)
+    if (!org) return e(404, 'not_found', 'Organization not found')
+    const projects = db.projects.filter(p => p.organizationId === org.id)
+    const rows = projects.map(p => {
+      const task = db.provisioning_tasks.filter(t => t.projectId === p.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] || null
+      return { project: { ...p, organization: org, environments: db.environments.filter(e => e.projectId === p.id), capabilities: { canManageProvisioning: true, canManageApiKeys: true, canManageEnvironments: true, canUpdateProject: true } }, provisioning: task, capabilities: { canManageProvisioning: true, canManageApiKeys: true, canManageEnvironments: true, canUpdateProject: true } }
+    })
+    return r(200, ok(rows, requestId))
+  }
+
+  // ─── Cloud Billing ───────────────────────────────────────────────
+
+  // GET /api/v1/cloud/billing/wallet
+  if (method === 'GET' && path.startsWith('/api/v1/cloud/billing/wallet')) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const u = new URL(path, 'http://localhost')
+    const projectId = u.searchParams.get('projectId')
+    if (!projectId) return e(400, 'invalid_request', 'projectId is required')
+    const db = loadDb()
+    const wallet = db.wallets[projectId]
+    if (!wallet) return e(404, 'not_found', 'Wallet not found')
+    return r(200, ok(wallet, requestId))
+  }
+
+  // GET /api/v1/cloud/billing/transactions
+  if (method === 'GET' && path.startsWith('/api/v1/cloud/billing/transactions')) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const u = new URL(path, 'http://localhost')
+    const projectId = u.searchParams.get('projectId')
+    if (!projectId) return e(400, 'invalid_request', 'projectId is required')
+    const db = loadDb()
+    return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, Number(u.searchParams.get('limit')) || 50), requestId))
+  }
+
+  // GET /api/v1/cloud/usage/events
+  if (method === 'GET' && path.startsWith('/api/v1/cloud/usage/events')) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const u = new URL(path, 'http://localhost')
+    const projectId = u.searchParams.get('projectId')
+    if (!projectId) return e(400, 'invalid_request', 'projectId is required')
+    const db = loadDb()
+    return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, Number(u.searchParams.get('limit')) || 50), requestId))
+  }
+
+  // POST /api/v1/cloud/billing/topup
+  if (method === 'POST' && path === '/api/v1/cloud/billing/topup') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.projectId || !payload.amount) return e(400, 'invalid_request', 'projectId and amount are required')
+    const db = loadDb()
+    const wallet = db.wallets[payload.projectId]
+    if (!wallet) return e(404, 'not_found', 'Wallet not found')
+    const topupId = makeId('topup')
+    return r(200, ok({
+      topup: { id: topupId, walletId: wallet.id, amount: payload.amount, status: 'pending' },
+      stripePublishableKey: null,
+      clientSecret: null,
+    }, requestId))
+  }
+
+  // POST /api/v1/cloud/billing/topup/confirm
+  if (method === 'POST' && path === '/api/v1/cloud/billing/topup/confirm') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
+    const db = loadDb()
+    const wallet = db.wallets[payload.projectId]
+    if (!wallet) return e(404, 'not_found', 'Wallet not found')
+    const now = new Date().toISOString()
+    wallet.balance += payload.amount || 100
+    wallet.lifetimeCredits += payload.amount || 100
+    wallet.updatedAt = now
+    db.transactions.push({
+      id: makeId('txn'), walletId: wallet.id, type: 'topup', creditsDelta: payload.amount || 100,
+      balanceAfter: wallet.balance, product: null, action: 'topup', reference: payload.topupId || null,
+      metadata: null, createdAt: now,
+    })
+    saveDb(db)
+    return r(200, ok({
+      topup: { id: payload.topupId || makeId('topup'), walletId: wallet.id, amount: payload.amount || 100, status: 'completed' },
+      wallet,
+    }, requestId))
+  }
+
+  // ─── Usage charge (existing) ─────────────────────────────────────
+
+  if (method === 'POST' && path === '/api/v1/cloud/usage/charge') {
     const apiKey = extractApiKey(headers)
-    if (!apiKey) return error(401, 'missing_api_key', 'API key required')
-
-    let payload
-    try { payload = typeof body === 'string' ? JSON.parse(body) : body } catch {
-      return error(400, 'invalid_request', 'Invalid JSON body')
-    }
-
-    if (!payload.action || !payload.credits) {
-      return error(400, 'invalid_request', 'action and credits are required')
-    }
-
+    if (!apiKey) return e(401, 'missing_api_key', 'API key required')
+    const payload = jsonBody(body)
+    if (!payload || !payload.action || !payload.credits) return e(400, 'invalid_request', 'action and credits are required')
     try {
       const db = loadDb()
       const userId = db.api_keys[apiKey]
-      if (!userId) return error(401, 'invalid_api_key', 'Invalid or expired API key')
-
+      if (!userId) return e(401, 'invalid_api_key', 'Invalid or expired API key')
       const profile = db.profiles[userId]
-      if (!profile) return error(402, 'insufficient_credits', 'No active subscription or credits found')
-
-      const totalCredits = profile.purchased_credits_balance || 0
-      if (totalCredits < payload.credits) {
-        return error(402, 'insufficient_credits', `Insufficient credits. Required: ${payload.credits}, Balance: ${totalCredits}`)
-      }
-
+      if (!profile) return e(402, 'insufficient_credits', 'No active subscription or credits found')
+      const total = profile.purchased_credits_balance || 0
+      if (total < payload.credits) return e(402, 'insufficient_credits', `Insufficient credits. Required: ${payload.credits}, Balance: ${total}`)
       profile.purchased_credits_balance -= payload.credits
-      db.usage_events.push({
-        user_id: userId,
-        product: payload.product || 'tera_api',
-        action: payload.action,
-        credits: payload.credits,
-        metadata: payload.metadata || {},
-        created_at: new Date().toISOString(),
-      })
+      db.usage_events.push({ user_id: userId, product: payload.product || 'tera_api', action: payload.action, credits: payload.credits, metadata: payload.metadata || {}, created_at: new Date().toISOString() })
       saveDb(db)
-
-      return respond(200, {
-        data: { ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } },
-        meta: { requestId },
-      })
+      return r(200, ok({ ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } }, requestId))
     } catch (err) {
-      return error(503, 'billing_unavailable', 'Billing service error: ' + err.message)
+      return e(503, 'billing_unavailable', err.message)
     }
   }
 
-  return error(404, 'not_found', `Unknown endpoint: ${path}`)
+  return e(404, 'not_found', `Unknown endpoint: ${method} ${path}`)
 }
 
 export async function handler(event) {
