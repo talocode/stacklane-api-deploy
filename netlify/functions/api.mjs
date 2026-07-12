@@ -126,10 +126,11 @@ function handleError(err, requestId, origin) {
   return withCors(respond(503, fail('internal_error', err.message, requestId)), origin)
 }
 
-async function routeHandler(method, rawPath, headers, body) {
+async function routeHandler(method, rawPath, headers, body, queryParams) {
   const path = normalizePath(rawPath)
   const requestId = makeRequestId()
   const origin = headers['origin'] || headers['Origin'] || ''
+  const query = queryParams || {}
 
   function r(status, data, extra) { return withCors(respond(status, data, extra), origin) }
   function e(status, code, msg) { return r(status, fail(code, msg, requestId)) }
@@ -477,8 +478,7 @@ async function routeHandler(method, rawPath, headers, body) {
   // GET /api/v1/cloud/billing/wallet
   if (method === 'GET' && path.startsWith('/api/v1/cloud/billing/wallet')) {
     const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const u = new URL(path, 'http://localhost')
-    const projectId = u.searchParams.get('projectId')
+    const projectId = query.projectId
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = loadDb()
     const wallet = db.wallets[projectId]
@@ -489,21 +489,19 @@ async function routeHandler(method, rawPath, headers, body) {
   // GET /api/v1/cloud/billing/transactions
   if (method === 'GET' && path.startsWith('/api/v1/cloud/billing/transactions')) {
     const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const u = new URL(path, 'http://localhost')
-    const projectId = u.searchParams.get('projectId')
+    const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = loadDb()
-    return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, Number(u.searchParams.get('limit')) || 50), requestId))
+    return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit), requestId))
   }
 
   // GET /api/v1/cloud/usage/events
   if (method === 'GET' && path.startsWith('/api/v1/cloud/usage/events')) {
     const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const u = new URL(path, 'http://localhost')
-    const projectId = u.searchParams.get('projectId')
+    const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = loadDb()
-    return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, Number(u.searchParams.get('limit')) || 50), requestId))
+    return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit), requestId))
   }
 
   // POST /api/v1/cloud/billing/topup
@@ -578,5 +576,6 @@ export async function handler(event) {
   const path = event.path || '/'
   const headers = event.headers || {}
   const body = event.body ? (event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf-8') : event.body) : null
-  return await routeHandler(method, path, headers, body)
+  const queryParams = event.queryStringParameters || {}
+  return await routeHandler(method, path, headers, body, queryParams)
 }
