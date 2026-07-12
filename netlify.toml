@@ -1,5 +1,5 @@
 [build]
-  command = "echo 'Functions only'"
+  command = "mkdir -p public && echo 'OK' > public/index.html"
   functions = "netlify/functions"
   publish = "public"
 
