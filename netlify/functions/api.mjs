@@ -1,22 +1,58 @@
 import { randomUUID } from 'node:crypto'
-import pg from 'pg'
+import initSqlJs from 'sql.js'
+import fs from 'node:fs'
+import path from 'node:path'
 
 export const config = {
   path: '/*',
   preferStatic: true,
 }
 
-const { Pool } = pg
+const DB_PATH = '/tmp/stacklane.db'
 
-let pool
-function getPool() {
-  if (!pool) {
-    const databaseUrl = process.env.DATABASE_URL
-    if (databaseUrl) {
-      pool = new Pool({ connectionString: databaseUrl, max: 3 })
-    }
+let db
+
+async function getDb() {
+  if (db) return db
+  const SQL = await initSqlJs()
+  if (fs.existsSync(DB_PATH)) {
+    const buffer = fs.readFileSync(DB_PATH)
+    db = new SQL.Database(buffer)
+  } else {
+    db = new SQL.Database()
+    db.run(`
+      CREATE TABLE api_keys (
+        key TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE profiles (
+        id TEXT PRIMARY KEY,
+        purchased_credits_balance INTEGER DEFAULT 0,
+        free_plan_credits_used INTEGER DEFAULT 0
+      );
+      CREATE TABLE usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        product TEXT NOT NULL,
+        action TEXT NOT NULL,
+        credits INTEGER NOT NULL,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+    `)
+    // Seed a dev API key
+    db.run("INSERT OR IGNORE INTO api_keys (key, user_id) VALUES ('sk-dev-talocode', 'user-dev-001')")
+    db.run("INSERT OR IGNORE INTO profiles (id, purchased_credits_balance) VALUES ('user-dev-001', 1000)")
+    saveDb()
   }
-  return pool
+  return db
+}
+
+function saveDb() {
+  const data = db.export()
+  const buffer = Buffer.from(data)
+  fs.writeFileSync(DB_PATH, buffer)
 }
 
 function json(statusCode, data, extraHeaders) {
@@ -72,46 +108,37 @@ async function routeHandler(method, path, headers, body) {
     }
 
     try {
-      const db = getPool()
+      const database = await getDb()
 
-      if (!db) {
-        return json(200, {
-          data: { ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } },
-          meta: { requestId },
-        })
-      }
-
-      const userResult = await db.query(
-        'SELECT user_id FROM api_keys WHERE api_key = $1 LIMIT 1',
+      const userResult = database.exec(
+        'SELECT user_id FROM api_keys WHERE key = ? LIMIT 1',
         [apiKey]
       )
-      if (userResult.rows.length === 0) {
+      if (!userResult.length || !userResult[0].values.length) {
         return json(401, { error: { code: 'invalid_api_key', message: 'Invalid or expired API key', requestId } })
       }
-      const userId = userResult.rows[0].user_id
+      const userId = userResult[0].values[0][0]
 
-      const profileResult = await db.query(
-        'SELECT purchased_credits_balance, free_plan_credits_used FROM profiles WHERE id = $1 LIMIT 1',
+      const profileResult = database.exec(
+        'SELECT purchased_credits_balance FROM profiles WHERE id = ? LIMIT 1',
         [userId]
       )
-      if (profileResult.rows.length === 0) {
+      if (!profileResult.length || !profileResult[0].values.length) {
         return json(402, { error: { code: 'insufficient_credits', message: 'No active subscription or credits found', requestId } })
       }
-      const profile = profileResult.rows[0]
-      const totalCredits = profile.purchased_credits_balance || 0
+      const totalCredits = profileResult[0].values[0][0] || 0
       if (totalCredits < payload.credits) {
-        return json(402, { error: { code: 'insufficient_credits', message: `Insufficient Talocode Cloud credits. Required: ${payload.credits}, Balance: ${totalCredits}`, requestId } })
+        return json(402, { error: { code: 'insufficient_credits', message: `Insufficient credits. Required: ${payload.credits}, Balance: ${totalCredits}`, requestId } })
       }
 
-      await db.query(
-        'UPDATE profiles SET purchased_credits_balance = purchased_credits_balance - $1 WHERE id = $2',
-        [payload.credits, userId]
+      database.run('UPDATE profiles SET purchased_credits_balance = purchased_credits_balance - ? WHERE id = ?', [payload.credits, userId])
+
+      database.run(
+        'INSERT INTO usage_events (user_id, product, action, credits, metadata) VALUES (?, ?, ?, ?, ?)',
+        [userId, payload.product || 'tera_api', payload.action, payload.credits, JSON.stringify(payload.metadata || {})]
       )
 
-      await db.query(
-        'INSERT INTO usage_events (user_id, product, action, credits, metadata) VALUES ($1, $2, $3, $4, $5)',
-        [userId, payload.product || 'tera_api', payload.action, payload.credits, payload.metadata || {}]
-      ).catch(() => {})
+      saveDb()
 
       return json(200, {
         data: { ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } },
