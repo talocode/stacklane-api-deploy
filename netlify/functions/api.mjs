@@ -1,51 +1,24 @@
 import { randomUUID } from 'node:crypto'
-import initSqlJs from 'sql.js'
 import fs from 'node:fs'
 
-const DB_PATH = '/tmp/stacklane.db'
+const DB_PATH = '/tmp/stacklane-db.json'
 
-let db
-
-async function getDb() {
-  if (db) return db
-  const SQL = await initSqlJs()
-  if (fs.existsSync(DB_PATH)) {
-    const buffer = fs.readFileSync(DB_PATH)
-    db = new SQL.Database(buffer)
-  } else {
-    db = new SQL.Database()
-    db.run(`
-      CREATE TABLE api_keys (
-        key TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-      CREATE TABLE profiles (
-        id TEXT PRIMARY KEY,
-        purchased_credits_balance INTEGER DEFAULT 0,
-        free_plan_credits_used INTEGER DEFAULT 0
-      );
-      CREATE TABLE usage_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        product TEXT NOT NULL,
-        action TEXT NOT NULL,
-        credits INTEGER NOT NULL,
-        metadata TEXT DEFAULT '{}',
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-    `)
-    db.run("INSERT OR IGNORE INTO api_keys (key, user_id) VALUES ('sk-dev-talocode', 'user-dev-001')")
-    db.run("INSERT OR IGNORE INTO profiles (id, purchased_credits_balance) VALUES ('user-dev-001', 1000)")
-    saveDb()
+function loadDb() {
+  try {
+    return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
+  } catch {
+    const db = {
+      api_keys: { 'sk-dev-talocode': 'user-dev-001' },
+      profiles: { 'user-dev-001': { purchased_credits_balance: 1000, free_plan_credits_used: 0 } },
+      usage_events: [],
+    }
+    saveDb(db)
+    return db
   }
-  return db
 }
 
-function saveDb() {
-  const data = db.export()
-  const buffer = Buffer.from(data)
-  fs.writeFileSync(DB_PATH, buffer)
+function saveDb(db) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db))
 }
 
 function json(statusCode, data, extraHeaders) {
@@ -103,37 +76,33 @@ async function routeHandler(method, path, headers, body) {
     }
 
     try {
-      const database = await getDb()
+      const db = loadDb()
 
-      const userResult = database.exec(
-        'SELECT user_id FROM api_keys WHERE key = ? LIMIT 1',
-        [apiKey]
-      )
-      if (!userResult.length || !userResult[0].values.length) {
+      const userId = db.api_keys[apiKey]
+      if (!userId) {
         return json(401, { error: { code: 'invalid_api_key', message: 'Invalid or expired API key', requestId } })
       }
-      const userId = userResult[0].values[0][0]
 
-      const profileResult = database.exec(
-        'SELECT purchased_credits_balance FROM profiles WHERE id = ? LIMIT 1',
-        [userId]
-      )
-      if (!profileResult.length || !profileResult[0].values.length) {
+      const profile = db.profiles[userId]
+      if (!profile) {
         return json(402, { error: { code: 'insufficient_credits', message: 'No active subscription or credits found', requestId } })
       }
-      const totalCredits = profileResult[0].values[0][0] || 0
+
+      const totalCredits = profile.purchased_credits_balance || 0
       if (totalCredits < payload.credits) {
         return json(402, { error: { code: 'insufficient_credits', message: `Insufficient credits. Required: ${payload.credits}, Balance: ${totalCredits}`, requestId } })
       }
 
-      database.run('UPDATE profiles SET purchased_credits_balance = purchased_credits_balance - ? WHERE id = ?', [payload.credits, userId])
-
-      database.run(
-        'INSERT INTO usage_events (user_id, product, action, credits, metadata) VALUES (?, ?, ?, ?, ?)',
-        [userId, payload.product || 'tera_api', payload.action, payload.credits, JSON.stringify(payload.metadata || {})]
-      )
-
-      saveDb()
+      profile.purchased_credits_balance -= payload.credits
+      db.usage_events.push({
+        user_id: userId,
+        product: payload.product || 'tera_api',
+        action: payload.action,
+        credits: payload.credits,
+        metadata: payload.metadata || {},
+        created_at: new Date().toISOString(),
+      })
+      saveDb(db)
 
       return json(200, {
         data: { ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } },
