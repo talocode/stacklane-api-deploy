@@ -1,11 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import initSqlJs from 'sql.js'
 import fs from 'node:fs'
-import path from 'node:path'
 
 export const config = {
   path: '/*',
-  preferStatic: true,
+  preferStatic: false,
 }
 
 const DB_PATH = '/tmp/stacklane.db'
@@ -41,7 +40,6 @@ async function getDb() {
         created_at TEXT DEFAULT (datetime('now'))
       );
     `)
-    // Seed a dev API key
     db.run("INSERT OR IGNORE INTO api_keys (key, user_id) VALUES ('sk-dev-talocode', 'user-dev-001')")
     db.run("INSERT OR IGNORE INTO profiles (id, purchased_credits_balance) VALUES ('user-dev-001', 1000)")
     saveDb()
@@ -69,7 +67,17 @@ function extractApiKey(headers) {
   return headers['x-api-key'] || headers['X-Api-Key'] || null
 }
 
-async function routeHandler(method, path, headers, body) {
+function normalizePath(rawPath, method) {
+  let p = rawPath || '/'
+  const funcPrefix = '/.netlify/functions/api'
+  if (p.startsWith(funcPrefix)) {
+    p = p.slice(funcPrefix.length) || '/'
+  }
+  return p
+}
+
+async function routeHandler(method, rawPath, headers, body) {
+  const path = normalizePath(rawPath, method)
   const requestId = makeRequestId()
 
   if ((method === 'GET' || method === 'HEAD') && (path === '/' || path === '/health' || path === '/api/v1/health')) {
@@ -92,7 +100,9 @@ async function routeHandler(method, path, headers, body) {
     })
   }
 
-  if (method !== 'POST') return json(404, { error: { code: 'not_found', message: 'Not found', requestId } })
+  if (method !== 'POST') {
+    return json(404, { error: { code: 'not_found', message: `Not found: ${method} ${path}`, requestId } })
+  }
 
   if (path === '/api/v1/cloud/usage/charge') {
     const apiKey = extractApiKey(headers)
