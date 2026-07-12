@@ -2,11 +2,6 @@ import { randomUUID } from 'node:crypto'
 import initSqlJs from 'sql.js'
 import fs from 'node:fs'
 
-export const config = {
-  path: '/*',
-  preferStatic: false,
-}
-
 const DB_PATH = '/tmp/stacklane.db'
 
 let db
@@ -67,20 +62,10 @@ function extractApiKey(headers) {
   return headers['x-api-key'] || headers['X-Api-Key'] || null
 }
 
-function normalizePath(rawPath, method) {
-  let p = rawPath || '/'
-  const funcPrefix = '/.netlify/functions/api'
-  if (p.startsWith(funcPrefix)) {
-    p = p.slice(funcPrefix.length) || '/'
-  }
-  return p
-}
-
-async function routeHandler(method, rawPath, headers, body) {
-  const path = normalizePath(rawPath, method)
+async function routeHandler(method, path, headers, body) {
   const requestId = makeRequestId()
 
-  if ((method === 'GET' || method === 'HEAD') && (path === '/' || path === '/health' || path === '/api/v1/health')) {
+  if ((method === 'GET' || method === 'HEAD') && (path === '/' || path === '' || path === '/health' || path === '/api/v1/health')) {
     return json(200, { status: 'ok', service: 'stacklane-api', version: '0.1.0', requestId, timestamp: new Date().toISOString() })
   }
 

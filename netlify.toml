@@ -2,3 +2,8 @@
   command = "echo 'Functions only'"
   functions = "netlify/functions"
   publish = "public"
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
