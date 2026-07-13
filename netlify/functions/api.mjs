@@ -147,6 +147,11 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return r(200, ok({ status: 'ok', service: 'stacklane-api', version: '0.5.0', timestamp: new Date().toISOString() }, requestId))
   }
 
+  // Telemetry ping (no auth)
+  if (method === 'POST' && path === '/v1/telemetry/ping') {
+    return r(200, ok({ status: 'ok', ts: new Date().toISOString() }, requestId))
+  }
+
   // Pricing
   if (method === 'GET' && path === '/api/v1/cloud/pricing') {
     return r(200, ok({
