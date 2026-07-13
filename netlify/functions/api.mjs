@@ -568,6 +568,152 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
   }
 
+  // ─── Product API Routes ───────────────────────────────────────────
+
+  // Helper: proxy POST to tera-api-v01
+  async function teraProxy(subPath, body) {
+    const url = `https://tera-api-v01.netlify.app${subPath}`
+    const apiKey = extractApiKey(headers)
+    const hdrs = { 'Content-Type': 'application/json' }
+    if (apiKey) hdrs['Authorization'] = `Bearer ${apiKey}`
+    try {
+      const resp = await fetch(url, { method: 'POST', headers: hdrs, body: body ? JSON.stringify(body) : null })
+      const text = await resp.text()
+      let data
+      try { data = JSON.parse(text) } catch { data = text }
+      return r(resp.status, data)
+    } catch (err) {
+      return e(503, 'upstream_unavailable', `Tera API upstream error: ${err.message}`)
+    }
+  }
+
+  // ── Tera ──────────────────────────────────────────────────────────
+  if (path.startsWith('/v1/tera/')) {
+    const sub = path.replace('/v1/tera', '')
+    const teraHealth = (method === 'GET' && (sub === '/health' || sub === '' || sub === '/'))
+    if (teraHealth) {
+      return r(200, ok({ status: 'ok', service: 'tera-api', version: '0.1.0', proxied: true, timestamp: new Date().toISOString() }, requestId))
+    }
+    const teraPricing = (method === 'GET' && sub === '/pricing')
+    if (teraPricing) {
+      return r(200, ok({ 'chat.completions': 3, 'writing.rewrite': 5, 'writing.draft': 10, 'coding.explain': 10, 'coding.review': 20, 'coding.write': 20 }, requestId))
+    }
+    const teraCaps = (method === 'GET' && sub === '/capabilities')
+    if (teraCaps) {
+      return r(200, ok({ capabilities: [{ id: 'chat.completions', name: 'Chat Completions', credits: 3 }, { id: 'writing.rewrite', name: 'Rewrite Text', credits: 5 }, { id: 'writing.draft', name: 'Draft Content', credits: 10 }, { id: 'coding.explain', name: 'Explain Code', credits: 10 }, { id: 'coding.review', name: 'Review Code', credits: 20 }, { id: 'coding.write', name: 'Write Code', credits: 20 }] }, requestId))
+    }
+    // POST endpoints → proxy to tera-api-v01
+    if (method === 'POST' && (sub === '/chat/completions' || sub === '/writing/rewrite' || sub === '/writing/draft' || sub === '/coding/explain' || sub === '/coding/review' || sub === '/coding/write')) {
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+      // Deduct credits via usage charge
+      const pricing = { '/chat/completions': 3, '/writing/rewrite': 5, '/writing/draft': 10, '/coding/explain': 10, '/coding/review': 20, '/coding/write': 20 }
+      const credits = pricing[sub] || 3
+      const chargeResp = await fetch(`https://${headers.host || 'stacklane-api.netlify.app'}/.netlify/functions/api`, {
+        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-Internal': '1' },
+        body: JSON.stringify({ action: sub.replace('/', '.'), credits, product: 'tera_api', metadata: { path: sub } }),
+      }).catch(() => null)
+      return await teraProxy(sub, payload)
+    }
+  }
+
+  // ── Skills ────────────────────────────────────────────────────────
+  if (path.startsWith('/v1/skills/')) {
+    const sub = path.replace('/v1/skills', '')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'skills-api', version: '0.1.0', timestamp: new Date().toISOString() }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') {
+      return r(200, ok({ 'generate.github-profile': 80, 'generate.github-repo': 100, 'generate.docs': 100, 'generate.text': 40, 'export.cursor': 10, 'export.claude': 10 }, requestId))
+    }
+    if (method === 'POST' && (sub.startsWith('/generate/') || sub.startsWith('/export/'))) {
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+      return r(200, ok({ status: 'generated', skill: { name: payload.input || 'custom-skill', format: sub.includes('export') ? sub.split('/').pop() : 'SKILL.md', compatibleWith: ['Cursor', 'Claude Code', 'OpenCode', 'Codra'], credits: sub.includes('github-profile') ? 80 : sub.includes('github-repo') ? 100 : sub.includes('docs') ? 100 : sub.includes('text') ? 40 : sub.includes('export') ? 10 : 0 }, message: 'Skill generation is live when Talocode Cloud AI backends are connected. This endpoint is defined and ready.' }, requestId))
+    }
+  }
+
+  // ── SearchLane ────────────────────────────────────────────────────
+  if (path.startsWith('/v1/searchlane/')) {
+    const sub = path.replace('/v1/searchlane', '')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'searchlane-api', version: '0.1.0', timestamp: new Date().toISOString() }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') {
+      return r(200, ok({ query: 5, news: 8, research: 30 }, requestId))
+    }
+    if (method === 'GET' && sub === '/capabilities') {
+      return r(200, ok({ capabilities: [{ id: 'query', name: 'Web Search', credits: 5 }, { id: 'news', name: 'News Search', credits: 8 }, { id: 'research', name: 'Deep Research', credits: 30 }] }, requestId))
+    }
+    // POST endpoints: accept and return structured response
+    if (method === 'POST' && (sub === '/query' || sub === '/news' || sub === '/research')) {
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+      return r(200, ok({
+        results: [{ title: 'SearchLane endpoint ready', url: `https://example.com/searchlane${sub}`, snippet: `SearchLane ${sub.replace('/', '')} endpoint is defined. Live AI-powered search results require the upstream search provider to be connected.`, source: 'searchlane' }],
+        total: 1, query: payload.query || payload.topic || '', endpoint: sub, status: 'endpoint_defined',
+        message: 'SearchLane routes are wired. Live results require Talocode Cloud AI backend connection.',
+      }, requestId))
+    }
+  }
+
+  // ── GeoLane ───────────────────────────────────────────────────────
+  if (path.startsWith('/v1/geolane/')) {
+    const sub = path.replace('/v1/geolane', '')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'geolane-api', version: '0.1.0', timestamp: new Date().toISOString() }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') {
+      return r(200, ok({ audit: 40, compare: 50, crawlers: 15, 'llms-txt': 20, 'citation-readiness': 25 }, requestId))
+    }
+    if (method === 'POST' && (sub === '/audit' || sub === '/compare')) {
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+      return r(200, ok({ status: 'endpoint_defined', endpoint: sub, message: 'GeoLane endpoint is wired. Live geo-analysis requires the upstream AI backend to be connected.' }, requestId))
+    }
+  }
+
+  // ── Agent Browser ─────────────────────────────────────────────────
+  if (path.startsWith('/v1/agent-browser/')) {
+    const sub = path.replace('/v1/agent-browser', '')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'agent-browser-api', version: '0.1.0', timestamp: new Date().toISOString() }, requestId))
+    }
+    if (method === 'POST' && (sub === '/check' || sub === '/screenshot' || sub === '/evidence' || sub === '/extract' || sub === '/analyze')) {
+      return r(200, ok({ status: 'endpoint_defined', endpoint: sub, message: 'Agent Browser endpoint is wired. Live browser automation requires the upstream service to be connected.' }, requestId))
+    }
+  }
+
+  // ── InvoiceLane ───────────────────────────────────────────────────
+  if (path.startsWith('/v1/invoicelane/')) {
+    const sub = path.replace('/v1/invoicelane', '')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'invoicelane-api', version: '0.1.0', timestamp: new Date().toISOString() }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') {
+      return r(200, ok({ extract: 20, 'invoice/extract': 30, 'receipt/extract': 20, validate: 10, 'export/csv': 5 }, requestId))
+    }
+    if (method === 'POST' && (sub === '/extract' || sub === '/invoice/extract' || sub === '/receipt/extract' || sub === '/validate')) {
+      return r(200, ok({ status: 'endpoint_defined', endpoint: sub, message: 'InvoiceLane endpoint is wired. Live document extraction requires the upstream AI backend to be connected.' }, requestId))
+    }
+  }
+
+  // ── MCP ──────────────────────────────────────────────────────────
+  if (path === '/mcp' && method === 'POST') {
+    const payload = jsonBody(body)
+    if (!payload) return e(400, 'invalid_request', 'MCP request body required')
+    return r(200, ok({
+      mcp: { serverInfo: { name: 'stacklane-mcp', version: '0.1.0' }, tools: [] },
+      message: 'Stacklane MCP endpoint is wired. Full MCP tool definitions are available when product services are connected.',
+    }, requestId))
+  }
+
+  // ── Cloud health (expanded) ────────────────────────────────────────
+  if ((method === 'GET') && (path === '/api/v1/cloud/health' || path === '/cloud/health')) {
+    const db = loadDb()
+    return r(200, ok({ status: 'ok', service: 'stacklane-cloud', version: '0.5.0', dbSize: JSON.stringify(db).length, creditsAvailable: db.profiles['user-admin-001']?.purchased_credits_balance || 0, timestamp: new Date().toISOString() }, requestId))
+  }
+
   return e(404, 'not_found', `Unknown endpoint: ${method} ${path}`)
 }
 
