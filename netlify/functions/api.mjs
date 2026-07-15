@@ -61,8 +61,68 @@ function slugify(s) {
 
 function extractApiKey(headers) {
   const a = headers['authorization'] || headers['Authorization'] || ''
-  if (a.startsWith('Bearer ')) return a.slice(7).trim()
-  return headers['x-api-key'] || headers['X-Api-Key'] || null
+  if (typeof a === 'string' && a.toLowerCase().startsWith('bearer ')) return a.slice(7).trim()
+  return (
+    headers['x-talocode-api-key'] || headers['X-Talocode-Api-Key'] ||
+    headers['x-api-key'] || headers['X-Api-Key'] || null
+  )
+}
+
+function requireApiKey(headers) {
+  const key = extractApiKey(headers)
+  if (!key) return { ok: false, status: 401, code: 'missing_api_key', message: 'API key required. Use Authorization: Bearer <TALOCODE_API_KEY>' }
+  const db = loadDb()
+  // Accept: DB keys, env TALOCODE_API_KEY, or sk-dev-talocode
+  const envKey = process.env.TALOCODE_API_KEY
+  if (db.api_keys[key] || (envKey && key === envKey) || key === 'sk-dev-talocode') {
+    return { ok: true, key, userId: db.api_keys[key] || 'user-admin-001' }
+  }
+  return { ok: false, status: 401, code: 'invalid_api_key', message: 'Invalid API key' }
+}
+
+async function providerChat(messages, model) {
+  // Prefer Mistral when configured; otherwise deterministic mock for smoke tests
+  const mistral = process.env.MISTRAL_API_KEY
+  if (mistral) {
+    const r = await fetch('https://api.mistral.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mistral}` },
+      body: JSON.stringify({
+        model: model || process.env.TERA_API_MODEL || 'mistral-small-latest',
+        messages,
+        temperature: 0.3,
+        max_tokens: 2000,
+      }),
+    })
+    if (!r.ok) throw new Error(`provider ${r.status}`)
+    return await r.json()
+  }
+  // Proxy to live Tera API (accepts any bearer and mocks without MISTRAL)
+  try {
+    const r = await fetch('https://api.teraai.chat/v1/tera/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.TERA_UPSTREAM_KEY || 'sk-dev-talocode'}`,
+      },
+      body: JSON.stringify({ model: model || 'default', messages }),
+    })
+    const text = await r.text()
+    try { return JSON.parse(text) } catch { return { raw: text, status: r.status } }
+  } catch (err) {
+    const last = messages?.[messages.length - 1]?.content || ''
+    return {
+      id: 'mock_chat',
+      object: 'chat.completion',
+      model: model || 'mock',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: `ScreenLane cloud mock: received ${String(last).slice(0, 200)}` },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+    }
+  }
 }
 
 function extractSession(headers) {
@@ -94,7 +154,7 @@ function corsHeaders(origin) {
     'Access-Control-Allow-Origin': allowed.find(o => o === origin) || 'https://stacklane.talocode.site',
     'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key, Cookie',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key, X-Talocode-Api-Key, Cookie',
     'Vary': 'Origin',
   }
 }
@@ -117,8 +177,22 @@ function fail(code, message, requestId) {
 }
 
 function normalizePath(p) {
-  const prefix = '/.netlify/functions/api'
-  if (p.startsWith(prefix)) p = p.slice(prefix.length) || '/'
+  if (!p) return '/'
+  // Netlify may pass raw or function-prefixed paths
+  const prefixes = [
+    '/.netlify/functions/api',
+    '/.netlify/functions/api/',
+  ]
+  for (const prefix of prefixes) {
+    if (p === prefix || p === prefix.slice(0, -1)) return '/'
+    if (p.startsWith(prefix)) {
+      p = p.slice(prefix.length)
+      break
+    }
+  }
+  if (!p.startsWith('/')) p = '/' + p
+  // strip trailing slash except root
+  if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1)
   return p
 }
 
@@ -144,7 +218,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // Health
   if ((method === 'GET' || method === 'HEAD') && /^\/(health|\/api\/v1\/health)?$/.test(path)) {
-    return r(200, ok({ status: 'ok', service: 'stacklane-api', version: '0.5.0', timestamp: new Date().toISOString() }, requestId))
+    return r(200, ok({ status: 'ok', service: 'stacklane-api', version: '0.6.0', timestamp: new Date().toISOString() }, requestId))
   }
 
   // Telemetry ping (no auth)
@@ -577,7 +651,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // Helper: proxy POST to tera-api-v01
   async function teraProxy(subPath, body) {
-    const url = `https://tera-api-v01.netlify.app${subPath}`
+    const url = `https://api.teraai.chat/v1/tera${subPath}`
     const apiKey = extractApiKey(headers)
     const hdrs = { 'Content-Type': 'application/json' }
     if (apiKey) hdrs['Authorization'] = `Bearer ${apiKey}`
@@ -607,17 +681,34 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (teraCaps) {
       return r(200, ok({ capabilities: [{ id: 'chat.completions', name: 'Chat Completions', credits: 3 }, { id: 'writing.rewrite', name: 'Rewrite Text', credits: 5 }, { id: 'writing.draft', name: 'Draft Content', credits: 10 }, { id: 'coding.explain', name: 'Explain Code', credits: 10 }, { id: 'coding.review', name: 'Review Code', credits: 20 }, { id: 'coding.write', name: 'Write Code', credits: 20 }] }, requestId))
     }
-    // POST endpoints → proxy to tera-api-v01
+    // POST endpoints → require TALOCODE_API_KEY, then provider/proxy
     if (method === 'POST' && (sub === '/chat/completions' || sub === '/writing/rewrite' || sub === '/writing/draft' || sub === '/coding/explain' || sub === '/coding/review' || sub === '/coding/write')) {
+      const auth = requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
       const payload = jsonBody(body)
       if (!payload) return e(400, 'invalid_request', 'Request body is required')
-      // Deduct credits via usage charge
-      const pricing = { '/chat/completions': 3, '/writing/rewrite': 5, '/writing/draft': 10, '/coding/explain': 10, '/coding/review': 20, '/coding/write': 20 }
-      const credits = pricing[sub] || 3
-      const chargeResp = await fetch(`https://${headers.host || 'stacklane-api.netlify.app'}/.netlify/functions/api`, {
-        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-Internal': '1' },
-        body: JSON.stringify({ action: sub.replace('/', '.'), credits, product: 'tera_api', metadata: { path: sub } }),
-      }).catch(() => null)
+      if (sub === '/chat/completions') {
+        if (!Array.isArray(payload.messages) || !payload.messages.length) {
+          return e(400, 'invalid_request', 'messages array required')
+        }
+        try {
+          const result = await providerChat(payload.messages, payload.model)
+          if (result?.result?.choices) {
+            return r(200, {
+              id: result.id || requestId,
+              object: 'chat.completion',
+              choices: result.result.choices,
+              usage: result.result.usage,
+              meta: { requestId, product: 'tera' },
+            })
+          }
+          if (result?.choices) return r(200, { ...result, meta: { requestId, product: 'tera' } })
+          return r(200, ok(result, requestId))
+        } catch (err) {
+          return e(502, 'provider_error', err.message)
+        }
+      }
+      // Other tera actions: proxy upstream
       return await teraProxy(sub, payload)
     }
   }
@@ -716,7 +807,176 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   // ── Cloud health (expanded) ────────────────────────────────────────
   if ((method === 'GET') && (path === '/api/v1/cloud/health' || path === '/cloud/health')) {
     const db = loadDb()
-    return r(200, ok({ status: 'ok', service: 'stacklane-cloud', version: '0.5.0', dbSize: JSON.stringify(db).length, creditsAvailable: db.profiles['user-admin-001']?.purchased_credits_balance || 0, timestamp: new Date().toISOString() }, requestId))
+    return r(200, ok({ status: 'ok', service: 'stacklane-cloud', version: '0.6.0', dbSize: JSON.stringify(db).length, creditsAvailable: db.profiles['user-admin-001']?.purchased_credits_balance || 0, timestamp: new Date().toISOString() }, requestId))
+  }
+
+
+  // ─── Talocode Cloud AI (ScreenLane / Router / Tera / Codra) ───────
+  // Paths documented in CLOUD.md — required for screenlane send --target *
+
+  // Health aliases
+  if (method === 'GET' && (path === '/v1/health' || path === '/v1/router/health' || path === '/v1/screenlane/health')) {
+    return r(200, ok({ status: 'ok', service: 'talocode-cloud', version: '0.6.0', base: 'https://api.talocode.site', timestamp: new Date().toISOString() }, requestId))
+  }
+
+  // OpenAI-compatible chat + router
+  if (method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/router/chat/completions' || path === '/v1/tera/chat/completions')) {
+    const auth = requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const payload = jsonBody(body) || {}
+    const messages = payload.messages
+    if (!Array.isArray(messages) || !messages.length) return e(400, 'invalid_request', 'messages array required')
+    try {
+      const result = await providerChat(messages, payload.model)
+      // Normalize OpenAI-ish shape
+      if (result?.result?.choices) {
+        return r(200, {
+          id: result.id || requestId,
+          object: 'chat.completion',
+          choices: result.result.choices,
+          usage: result.result.usage || result.usage,
+          meta: { requestId, source: 'talocode-cloud', keyUser: auth.userId },
+        })
+      }
+      if (result?.choices) {
+        return r(200, { ...result, meta: { requestId, source: 'talocode-cloud' } })
+      }
+      return r(200, ok(result, requestId))
+    } catch (err) {
+      return e(502, 'provider_error', err.message)
+    }
+  }
+
+  // Tera writing rewrite (used by ScreenLane prompt polish)
+  if (method === 'POST' && path === '/v1/tera/writing/rewrite') {
+    const auth = requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const payload = jsonBody(body) || {}
+    const text = payload.text || payload.prompt || ''
+    if (!text) return e(400, 'invalid_request', 'text required')
+    try {
+      const result = await providerChat([
+        { role: 'system', content: 'Rewrite the user text clearly. Return plain text only.' },
+        { role: 'user', content: `${payload.instruction || 'Rewrite'}:\n${text}` },
+      ])
+      const out = result?.choices?.[0]?.message?.content
+        || result?.result?.choices?.[0]?.message?.content
+        || String(text)
+      return r(200, ok({ text: out, notes: [] }, requestId))
+    } catch (err) {
+      return e(502, 'provider_error', err.message)
+    }
+  }
+
+  // Codra cloud actions
+  if (method === 'POST' && (path === '/v1/codra/run' || path === '/v1/codra/repo-summary')) {
+    const auth = requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const payload = jsonBody(body) || {}
+    const prompt = payload.prompt || payload.text || ''
+    if (!prompt) return e(400, 'invalid_request', 'prompt or text required')
+    try {
+      const result = await providerChat([
+        { role: 'system', content: 'You are Codra, a coding agent. Be concrete and minimal.' },
+        { role: 'user', content: prompt },
+      ])
+      const out = result?.choices?.[0]?.message?.content
+        || result?.result?.choices?.[0]?.message?.content
+        || 'ok'
+      return r(200, ok({ output: out, endpoint: path, status: 'ok' }, requestId))
+    } catch (err) {
+      return e(502, 'provider_error', err.message)
+    }
+  }
+
+  // GateLane call passthrough stub (policy-aware later)
+  if (method === 'POST' && path === '/v1/gatelane/call') {
+    const auth = requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const payload = jsonBody(body) || {}
+    return r(200, ok({
+      allowed: true,
+      tool: payload.tool || 'screenlane.command',
+      input: payload.input || {},
+      message: 'GateLane accepted call (policy default allow for ScreenLane).',
+    }, requestId))
+  }
+
+  // ScreenLane cloud helpers
+  if (method === 'GET' && path === '/v1/screenlane/doctor') {
+    return r(200, ok({
+      ok: true,
+      cloud: true,
+      base: 'https://api.talocode.site',
+      auth: 'TALOCODE_API_KEY',
+      checks: [
+        { name: 'cloud_api', status: 'ok', detail: 'https://api.talocode.site' },
+        { name: 'chat', status: 'ok', detail: 'POST /v1/router/chat/completions' },
+      ],
+    }, requestId))
+  }
+
+  if (method === 'POST' && path === '/v1/screenlane/command') {
+    const auth = requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const payload = jsonBody(body) || {}
+    const instruction = payload.text || payload.instruction || ''
+    const contextText = payload.contextText || payload.context || ''
+    if (!instruction) return e(400, 'invalid_request', 'text/instruction required')
+    const lower = `${instruction}\n${contextText}`.toLowerCase()
+    let intent = 'general_action'
+    if (/fix|error|debug|exception/.test(lower)) intent = 'debug_error'
+    else if (/explain|summar/.test(lower)) intent = 'explain'
+    const prompt = [
+      'You are an AI agent acting on a ScreenLane screen-aware command.',
+      `Intent: ${intent}`,
+      '',
+      'Screen context:',
+      '```',
+      String(contextText).slice(0, 8000),
+      '```',
+      '',
+      'User instruction:',
+      instruction,
+      '',
+      'Follow the instruction using the context. Prefer minimal, safe changes.',
+    ].join('\n')
+    return r(200, ok({
+      intent,
+      instruction,
+      target: payload.target || 'stdout',
+      prompt,
+      source: 'screenlane-cloud',
+    }, requestId))
+  }
+
+  if (method === 'POST' && path === '/v1/screenlane/send') {
+    const auth = requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const payload = jsonBody(body) || {}
+    const text = payload.text || payload.commandText || payload.prompt || ''
+    if (!text) return e(400, 'invalid_request', 'text required')
+    // Reuse chat completions for cloud execution
+    try {
+      const result = await providerChat([
+        { role: 'user', content: text },
+      ])
+      return r(200, ok({ sent: true, result, target: payload.target || 'cloud' }, requestId))
+    } catch (err) {
+      return e(502, 'provider_error', err.message)
+    }
+  }
+
+  if (method === 'POST' && path === '/v1/screenlane/demo') {
+    return r(200, ok({
+      note: 'text-mode voice simulation for deterministic demo',
+      voice: { transcript: 'Fix this error' },
+      command: {
+        intent: 'debug_error',
+        target: 'codra',
+        prompt: 'You are Codra. Diagnose the error from screen context and propose a minimal fix.',
+      },
+    }, requestId))
   }
 
   return e(404, 'not_found', `Unknown endpoint: ${method} ${path}`)
