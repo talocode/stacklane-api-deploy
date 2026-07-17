@@ -1028,6 +1028,34 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }, requestId))
   }
 
+
+  // ── VerifyLane / TraceLane / HandoffLane / StyleLane / SpendCaps (thin edge) ──
+  if (path.startsWith('/v1/verifylane/')) {
+    const sub = path.replace('/v1/verifylane', '')
+    if (method === 'GET' && (sub === '/health' || sub === '/pricing' || sub === '/capabilities')) {
+      return r(200, ok({ status: 'ok', service: 'verifylane', version: '0.1.0', note: 'Full engine on Stacklane monorepo deploy; edge stub health/pricing' }, requestId))
+    }
+    if (method === 'POST') {
+      return r(501, fail('not_deployed', 'VerifyLane engine requires Stacklane monorepo function bundle with services/verifylane. Use npm @talocode/verifylane local engine until redeploy.', requestId))
+    }
+  }
+  if (path.startsWith('/v1/tracelane/')) {
+    if (method === 'GET' && path.includes('/health')) return r(200, ok({ status: 'ok', service: 'tracelane', version: '0.1.0' }, requestId))
+    return r(501, fail('not_deployed', 'TraceLane full engine pending monorepo function deploy. npm @talocode/tracelane works locally.', requestId))
+  }
+  if (path.startsWith('/v1/handofflane/')) {
+    if (method === 'GET' && path.includes('/health')) return r(200, ok({ status: 'ok', service: 'handofflane', version: '0.1.0' }, requestId))
+    return r(501, fail('not_deployed', 'HandoffLane full engine pending monorepo function deploy. npm @talocode/handofflane works locally.', requestId))
+  }
+  if (path.startsWith('/v1/stylelane/')) {
+    if (method === 'GET' && path.includes('/health')) return r(200, ok({ status: 'ok', service: 'stylelane', version: '0.1.0' }, requestId))
+    return r(501, fail('not_deployed', 'StyleLane full engine pending monorepo function deploy. npm @talocode/stylelane works locally.', requestId))
+  }
+  if (path.startsWith('/v1/spendcaps/')) {
+    if (method === 'GET') return r(200, ok({ status: 'ok', service: 'spendcaps', version: '0.1.0', note: 'Full caps on monorepo deploy' }, requestId))
+  }
+
+
   return e(404, 'not_found', `Unknown endpoint: ${method} ${path}`)
 }
 
