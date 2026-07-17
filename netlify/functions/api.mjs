@@ -234,6 +234,9 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           'chat.completions': 3, 'writing.rewrite': 5, 'writing.draft': 10,
           'coding.explain': 10, 'coding.review': 20, 'coding.write': 20,
         },
+        searchlane: {
+          'searchlane.query': 5, 'searchlane.news': 8, 'searchlane.research': 30,
+        },
       },
     }, requestId))
   }
@@ -729,28 +732,74 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
   }
 
-  // ── SearchLane ────────────────────────────────────────────────────
+  // ── SearchLane (live engine) ──────────────────────────────────────
   if (path.startsWith('/v1/searchlane/')) {
     const sub = path.replace('/v1/searchlane', '')
+    const {
+      SEARCHLANE_VERSION,
+      runSearchQuery,
+      runSearchNews,
+      runResearch,
+      getSearchLanePricing,
+      getSearchLaneCapabilities,
+    } = await import('./searchlane-engine.mjs')
+
     if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
-      return r(200, ok({ status: 'ok', service: 'searchlane-api', version: '0.1.0', timestamp: new Date().toISOString() }, requestId))
+      return r(200, {
+        ok: true,
+        service: 'searchlane',
+        version: SEARCHLANE_VERSION,
+        endpoints: getSearchLaneCapabilities().endpoints,
+        meta: { requestId },
+      })
     }
     if (method === 'GET' && sub === '/pricing') {
-      return r(200, ok({ query: 5, news: 8, research: 30 }, requestId))
+      return r(200, { ...getSearchLanePricing(), meta: { requestId } })
     }
     if (method === 'GET' && sub === '/capabilities') {
-      return r(200, ok({ capabilities: [{ id: 'query', name: 'Web Search', credits: 5 }, { id: 'news', name: 'News Search', credits: 8 }, { id: 'research', name: 'Deep Research', credits: 30 }] }, requestId))
+      return r(200, { ...getSearchLaneCapabilities(), meta: { requestId } })
     }
-    // POST endpoints: accept and return structured response
     if (method === 'POST' && (sub === '/query' || sub === '/news' || sub === '/research')) {
-      const payload = jsonBody(body)
-      if (!payload) return e(400, 'invalid_request', 'Request body is required')
-      return r(200, ok({
-        results: [{ title: 'SearchLane endpoint ready', url: `https://example.com/searchlane${sub}`, snippet: `SearchLane ${sub.replace('/', '')} endpoint is defined. Live AI-powered search results require the upstream search provider to be connected.`, source: 'searchlane' }],
-        total: 1, query: payload.query || payload.topic || '', endpoint: sub, status: 'endpoint_defined',
-        message: 'SearchLane routes are wired. Live results require Talocode Cloud AI backend connection.',
-      }, requestId))
+      const auth = requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body) || {}
+      const query = typeof payload.query === 'string' ? payload.query.trim()
+        : typeof payload.q === 'string' ? payload.q.trim() : ''
+      if (!query) return e(422, 'validation_error', 'query is required')
+      const limit = typeof payload.limit === 'number' ? payload.limit : undefined
+      const creditMap = { '/query': 5, '/news': 8, '/research': 30 }
+      const actionMap = { '/query': 'searchlane.query', '/news': 'searchlane.news', '/research': 'searchlane.research' }
+      const credits = creditMap[sub]
+      const action = actionMap[sub]
+      // Charge profile credits (JSON store)
+      try {
+        const db = loadDb()
+        const userId = auth.userId || db.api_keys[auth.key] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const bal = profile.purchased_credits_balance || 0
+        if (bal < credits) {
+          return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: bal, meta: { requestId } })
+        }
+        profile.purchased_credits_balance = bal - credits
+        db.usage_events.push({
+          user_id: userId, product: 'searchlane', action, credits,
+          metadata: { query, limit }, created_at: new Date().toISOString(), request_id: requestId,
+        })
+        saveDb(db)
+        let result
+        if (sub === '/query') result = await runSearchQuery(query, { limit })
+        else if (sub === '/news') result = await runSearchNews(query, { limit })
+        else result = await runResearch(query, { limit, fetchPages: payload.fetchPages !== false })
+        return r(200, {
+          ...result,
+          usage: { credits, action, remaining: profile.purchased_credits_balance },
+          meta: { requestId },
+        })
+      } catch (err) {
+        return e(422, 'search_error', err.message || 'Search failed')
+      }
     }
+    return e(404, 'not_found', `SearchLane route not found: ${method} ${path}`)
   }
 
   // ── GeoLane ───────────────────────────────────────────────────────
