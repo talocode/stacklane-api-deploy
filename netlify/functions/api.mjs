@@ -237,6 +237,9 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         searchlane: {
           'searchlane.query': 5, 'searchlane.news': 8, 'searchlane.research': 30,
         },
+        calclane: {
+          'calclane.evaluate': 1, 'calclane.dispatch': 1,
+        },
       },
     }, requestId))
   }
@@ -800,6 +803,92 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       }
     }
     return e(404, 'not_found', `SearchLane route not found: ${method} ${path}`)
+  }
+
+
+  // ── CalcLane (live engine) ───────────────────────────────────────
+  if (path.startsWith('/v1/calclane/')) {
+    const sub = path.replace('/v1/calclane', '')
+    const {
+      CALCLANE_VERSION,
+      evaluateExpression,
+      runDispatch,
+      getCalcLanePricing,
+      getCalcLaneCapabilities,
+    } = await import('./calclane-engine.mjs')
+
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, {
+        ok: true,
+        service: 'calclane',
+        version: CALCLANE_VERSION,
+        endpoints: getCalcLaneCapabilities().endpoints,
+        meta: { requestId },
+      })
+    }
+    if (method === 'GET' && sub === '/pricing') {
+      return r(200, { ...getCalcLanePricing(), meta: { requestId } })
+    }
+    if (method === 'GET' && sub === '/capabilities') {
+      return r(200, { ...getCalcLaneCapabilities(), meta: { requestId } })
+    }
+    if (method === 'POST' && (sub === '/evaluate' || sub === '/dispatch')) {
+      const auth = requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body) || {}
+      const credits = 1
+      const action = sub === '/evaluate' ? 'calclane.evaluate' : 'calclane.dispatch'
+      try {
+        const db = loadDb()
+        const userId = auth.userId || db.api_keys[auth.key] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const bal = profile.purchased_credits_balance || 0
+        if (bal < credits) {
+          return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: bal, meta: { requestId } })
+        }
+        profile.purchased_credits_balance = bal - credits
+        db.usage_events.push({
+          user_id: userId, product: 'calclane', action, credits,
+          metadata: sub === '/evaluate'
+            ? { expression: String(payload.expression || payload.expr || payload.q || '').slice(0, 200) }
+            : { commandCount: Array.isArray(payload.commands) ? payload.commands.length : 0 },
+          created_at: new Date().toISOString(), request_id: requestId,
+        })
+        saveDb(db)
+
+        if (sub === '/evaluate') {
+          const expression = typeof payload.expression === 'string' ? payload.expression
+            : typeof payload.expr === 'string' ? payload.expr
+            : typeof payload.q === 'string' ? payload.q : ''
+          if (!String(expression).trim()) return e(422, 'validation_error', 'expression is required')
+          const result = evaluateExpression(String(expression), {
+            mode: payload.mode === 'standard' ? 'standard' : 'scientific',
+            angle: payload.angle === 'rad' || payload.angle === 'grad' ? payload.angle : 'deg',
+            fe: Boolean(payload.fe),
+          })
+          return r(result.ok ? 200 : 422, {
+            ...result,
+            usage: { credits, action, remaining: profile.purchased_credits_balance },
+            meta: { requestId },
+          })
+        }
+
+        if (!Array.isArray(payload.commands)) return e(422, 'validation_error', 'commands array is required')
+        const result = runDispatch({
+          commands: payload.commands,
+          mode: payload.mode === 'standard' ? 'standard' : 'scientific',
+          angle: payload.angle === 'rad' || payload.angle === 'grad' ? payload.angle : 'deg',
+        })
+        return r(result.ok ? 200 : 422, {
+          ...result,
+          usage: { credits, action, remaining: profile.purchased_credits_balance },
+          meta: { requestId },
+        })
+      } catch (err) {
+        return e(422, 'calc_error', err.message || 'Calculation failed')
+      }
+    }
+    return e(404, 'not_found', `CalcLane route not found: ${method} ${path}`)
   }
 
   // ── GeoLane ───────────────────────────────────────────────────────
