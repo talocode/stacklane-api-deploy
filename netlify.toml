@@ -1,7 +1,11 @@
 [build]
-  command = "mkdir -p public && echo 'OK' > public/index.html"
+  command = "npm install && mkdir -p public && echo 'OK' > public/index.html"
   functions = "netlify/functions"
   publish = "public"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["@netlify/blobs"]
 
 [[redirects]]
   from = "/*"

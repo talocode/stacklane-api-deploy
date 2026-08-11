@@ -2,45 +2,115 @@ import { randomUUID, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 
 const DB_PATH = '/tmp/stacklane-db.json'
+const BLOB_STORE = 'stacklane-cloud'
+const BLOB_KEY = 'main-db'
 
-function loadDb() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
-  } catch {
-    const now = new Date().toISOString()
-    const db = {
-      users: [
-        { id: 'user-admin-001', email: 'admin@stacklane.local', name: 'Admin', password: 'stacklane-admin', status: 'active', lastLoginAt: null, createdAt: now, updatedAt: now },
-      ],
-      sessions: {},
-      api_keys: { 'sk-dev-talocode': 'user-admin-001' },
-      project_api_keys: [],
-      profiles: { 'user-admin-001': { purchased_credits_balance: 10000, free_plan_credits_used: 0 } },
-      usage_events: [],
-      regions: [
-        { id: 'reg-ng-lagos', code: 'ng-lagos', name: 'Lagos, Nigeria', marketScope: 'africa-west', deploymentTarget: 'africa-west1', isActive: true, createdAt: now, updatedAt: now },
-        { id: 'reg-us-east', code: 'us-east', name: 'US East (N. Virginia)', marketScope: 'global', deploymentTarget: 'us-east-1', isActive: true, createdAt: now, updatedAt: now },
-      ],
-      organizations: [
-        { id: 'org-talocode', name: 'Talocode', slug: 'talocode', status: 'active', createdAt: now, updatedAt: now },
-      ],
-      projects: [
-        { id: 'proj-tera-api', name: 'Tera API', slug: 'tera-api', status: 'ready', region: 'us-east', description: 'Talocode Tera API', organizationId: 'org-talocode', createdAt: now, updatedAt: now },
-      ],
-      environments: [],
-      provisioning_tasks: [],
-      provisioning_attempts: [],
-      audit_events: [],
-      wallets: { 'proj-tera-api': { id: 'wallet-tera', projectId: 'proj-tera-api', balance: 5000, lifetimeCredits: 5000, lifetimeSpend: 0, freeCreditsGranted: true, createdAt: now, updatedAt: now } },
-      transactions: [],
-    }
-    saveDb(db)
-    return db
+/** @type {any} */
+let dbCache = null
+
+function seedDb() {
+  const now = new Date().toISOString()
+  return {
+    users: [
+      { id: 'user-admin-001', email: 'admin@stacklane.local', name: 'Admin', password: 'stacklane-admin', status: 'active', lastLoginAt: null, createdAt: now, updatedAt: now },
+    ],
+    sessions: {},
+    api_keys: { 'sk-dev-talocode': 'user-admin-001' },
+    project_api_keys: [],
+    cloud_projects: [],
+    cloud_api_keys: [],
+    topups: [],
+    profiles: { 'user-admin-001': { purchased_credits_balance: 10000, free_plan_credits_used: 0 } },
+    usage_events: [],
+    regions: [
+      { id: 'reg-ng-lagos', code: 'ng-lagos', name: 'Lagos, Nigeria', marketScope: 'africa-west', deploymentTarget: 'africa-west1', isActive: true, createdAt: now, updatedAt: now },
+      { id: 'reg-us-east', code: 'us-east', name: 'US East (N. Virginia)', marketScope: 'global', deploymentTarget: 'us-east-1', isActive: true, createdAt: now, updatedAt: now },
+    ],
+    organizations: [
+      { id: 'org-talocode', name: 'Talocode', slug: 'talocode', status: 'active', createdAt: now, updatedAt: now },
+    ],
+    projects: [
+      { id: 'proj-tera-api', name: 'Tera API', slug: 'tera-api', status: 'ready', region: 'us-east', description: 'Talocode Tera API', organizationId: 'org-talocode', createdAt: now, updatedAt: now },
+    ],
+    environments: [],
+    provisioning_tasks: [],
+    provisioning_attempts: [],
+    audit_events: [],
+    wallets: { 'proj-tera-api': { id: 'wallet-tera', projectId: 'proj-tera-api', balance: 5000, lifetimeCredits: 5000, lifetimeSpend: 0, freeCreditsGranted: true, createdAt: now, updatedAt: now } },
+    transactions: [],
   }
 }
 
-function saveDb(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db))
+function getBlobStore() {
+  try {
+    const mod = globalThis.__netlify_blobs
+    if (!mod?.getStore) return null
+    const siteID = process.env.SITE_ID || process.env.NETLIFY_SITE_ID || process.env.BLOBS_SITE_ID
+    const token = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_API_TOKEN || process.env.NETLIFY_AUTH_TOKEN
+    // On Netlify runtime, getStore works without siteID/token (context injected).
+    // Outside, pass credentials when present.
+    if (siteID && token) {
+      return mod.getStore({ name: BLOB_STORE, consistency: 'strong', siteID, token })
+    }
+    return mod.getStore({ name: BLOB_STORE, consistency: 'strong' })
+  } catch (err) {
+    console.error('[db] getStore failed', err?.message || err)
+    return null
+  }
+}
+
+async function initBlobs() {
+  if (globalThis.__netlify_blobs) return
+  try {
+    globalThis.__netlify_blobs = await import('@netlify/blobs')
+  } catch {
+    globalThis.__netlify_blobs = null
+  }
+}
+
+async function loadDb() {
+  if (dbCache) return dbCache
+  await initBlobs()
+  const store = getBlobStore()
+  if (store) {
+    try {
+      const data = await store.get(BLOB_KEY, { type: 'json' })
+      if (data && Array.isArray(data.users)) {
+        dbCache = data
+        // warm /tmp cache for same instance
+        try { fs.writeFileSync(DB_PATH, JSON.stringify(dbCache)) } catch { /* ignore */ }
+        return dbCache
+      }
+    } catch (err) {
+      console.error('[db] blob load failed', err?.message || err)
+    }
+  }
+  try {
+    dbCache = JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
+    return dbCache
+  } catch {
+    dbCache = seedDb()
+    await saveDb(dbCache)
+    return dbCache
+  }
+}
+
+async function saveDb(db) {
+  dbCache = db
+  try {
+    fs.writeFileSync(DB_PATH, JSON.stringify(db))
+  } catch {
+    /* ignore */
+  }
+  await initBlobs()
+  const store = getBlobStore()
+  if (store) {
+    try {
+      await store.setJSON(BLOB_KEY, db)
+    } catch (err) {
+      console.error('[db] blob save failed', err?.message || err)
+    }
+  }
 }
 
 function makeToken() {
@@ -68,10 +138,10 @@ function extractApiKey(headers) {
   )
 }
 
-function requireApiKey(headers) {
+async function requireApiKey(headers) {
   const key = extractApiKey(headers)
   if (!key) return { ok: false, status: 401, code: 'missing_api_key', message: 'API key required. Use Authorization: Bearer <TALOCODE_API_KEY>' }
-  const db = loadDb()
+  const db = await loadDb()
   // Accept: DB keys, env TALOCODE_API_KEY, or sk-dev-talocode
   const envKey = process.env.TALOCODE_API_KEY
   if (db.api_keys[key] || (envKey && key === envKey) || key === 'sk-dev-talocode') {
@@ -134,10 +204,10 @@ function extractSession(headers) {
   return null
 }
 
-function authenticate(headers) {
+async function authenticate(headers) {
   const token = extractSession(headers)
   if (!token) return null
-  const db = loadDb()
+  const db = await loadDb()
   const session = db.sessions[token]
   if (!session) return null
   const user = db.users.find(u => u.id === session.userId)
@@ -219,8 +289,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   function r(status, data, extra) { return withCors(respond(status, data, extra), origin) }
   function e(status, code, msg) { return r(status, fail(code, msg, requestId)) }
-  function requireAuth() {
-    const user = authenticate(headers)
+  async function requireAuth() {
+    const user = await authenticate(headers)
     if (!user) return null
     return user
   }
@@ -266,7 +336,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       return e(422, 'validation_error', 'Password must be at least 8 characters')
     }
     const email = String(payload.email).toLowerCase().trim()
-    const db = loadDb()
+    const db = await loadDb()
     if (db.users.find((u) => u.email === email)) {
       return e(409, 'email_taken', 'An account with this email already exists')
     }
@@ -285,7 +355,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     db.profiles[user.id] = { purchased_credits_balance: 0, free_plan_credits_used: 0 }
     const token = makeToken()
     db.sessions[token] = { userId: user.id, createdAt: now }
-    saveDb(db)
+    await saveDb(db)
     const { password, ...safe } = user
     return withCors({
       statusCode: 201,
@@ -301,14 +371,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (method === 'POST' && path === '/auth/login') {
     const payload = jsonBody(body)
     if (!payload || !payload.email || !payload.password) return e(400, 'invalid_request', 'email and password are required')
-    const db = loadDb()
+    const db = await loadDb()
     const email = String(payload.email).toLowerCase().trim()
     const user = db.users.find(u => u.email === email || u.email === payload.email)
     if (!user || user.password !== payload.password) return e(401, 'invalid_credentials', 'Invalid email or password')
     const token = makeToken()
     db.sessions[token] = { userId: user.id, createdAt: new Date().toISOString() }
     user.lastLoginAt = new Date().toISOString()
-    saveDb(db)
+    await saveDb(db)
     const { password, ...safe } = user
     return withCors({
       statusCode: 200,
@@ -323,7 +393,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   if (method === 'POST' && path === '/auth/logout') {
     const token = extractSession(headers)
-    if (token) { const db = loadDb(); delete db.sessions[token]; saveDb(db) }
+    if (token) { const db = await loadDb(); delete db.sessions[token]; await saveDb(db) }
     return withCors({
       statusCode: 200,
       headers: {
@@ -336,7 +406,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
   if (method === 'GET' && path === '/auth/me') {
-    const user = requireAuth()
+    const user = await requireAuth()
     if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const { password, ...safe } = user
     return r(200, ok(safe, requestId))
@@ -345,7 +415,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   // ─── Regions ─────────────────────────────────────────────────────
 
   if (method === 'GET' && path === '/regions') {
-    const db = loadDb()
+    const db = await loadDb()
     return r(200, ok(db.regions, requestId))
   }
 
@@ -356,19 +426,19 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   const orgSub = orgMatch ? orgMatch[2] : null
 
   if (path === '/organizations' && method === 'GET') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     return r(200, ok(db.organizations, requestId))
   }
 
   if (path === '/organizations' && method === 'POST') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
-    const db = loadDb()
+    const db = await loadDb()
     const org = { id: makeId('org'), name: payload.name, slug: payload.slug || slugify(payload.name), status: 'active', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
     db.organizations.push(org)
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(org, requestId))
   }
 
@@ -381,16 +451,16 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   const projId4 = projMatch ? projMatch[4] : null
 
   if (path === '/projects' && method === 'GET') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     return r(200, ok(db.projects, requestId))
   }
 
   if (path === '/projects' && method === 'POST') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
-    const db = loadDb()
+    const db = await loadDb()
     const now = new Date().toISOString()
     const proj = {
       id: makeId('proj'), name: payload.name, slug: payload.slug || slugify(payload.name),
@@ -400,14 +470,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
     db.projects.push(proj)
     db.wallets[proj.id] = { id: makeId('wallet'), projectId: proj.id, balance: 0, lifetimeCredits: 0, lifetimeSpend: 0, freeCreditsGranted: false, createdAt: now, updatedAt: now }
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(proj, requestId))
   }
 
   // GET /projects/:slug
   if (projSlug && !projRes && method === 'GET' && path === `/projects/${projSlug}`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const org = db.organizations.find(o => o.id === proj.organizationId)
@@ -417,23 +487,23 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // PATCH /projects/:slug
   if (projSlug && !projRes && method === 'PATCH' && path === `/projects/${projSlug}`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
-    const db = loadDb()
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     if (payload.name) proj.name = payload.name
     if (payload.status) proj.status = payload.status
     if (payload.description !== undefined) proj.description = payload.description
     proj.updatedAt = new Date().toISOString()
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(proj, requestId))
   }
 
   // POST /projects/:slug/provision
   if (projRes === 'provision' && method === 'POST' && path === `/projects/${projSlug}/provision`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const now = new Date().toISOString()
@@ -445,14 +515,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
     db.provisioning_tasks.push(task)
     proj.status = 'provisioning'
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(task, requestId))
   }
 
   // GET /projects/:slug/provisioning
   if (projRes === 'provisioning' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/provisioning`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const task = db.provisioning_tasks.filter(t => t.projectId === proj.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] || null
@@ -463,8 +533,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /projects/:slug/provisioning/tasks
   if (projRes === 'provisioning' && projId3 === 'tasks' && !projId4 && method === 'GET') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     return r(200, ok(db.provisioning_tasks.filter(t => t.projectId === proj.id), requestId))
@@ -472,8 +542,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // POST /projects/:slug/provisioning/retry
   if (projRes === 'provisioning' && projId3 === 'retry' && !projId4 && method === 'POST') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const now = new Date().toISOString()
@@ -485,14 +555,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
     db.provisioning_tasks.push(task)
     proj.status = 'provisioning'
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(task, requestId))
   }
 
   // GET /projects/:slug/events
   if (projRes === 'events' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/events`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     return r(200, ok(db.audit_events.filter(e => e.projectId === proj.id), requestId))
@@ -500,8 +570,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /projects/:slug/api-keys
   if (projRes === 'api-keys' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/api-keys`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     return r(200, ok(db.project_api_keys.filter(k => k.projectId === proj.id), requestId))
@@ -509,10 +579,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // POST /projects/:slug/api-keys
   if (projRes === 'api-keys' && !projId3 && method === 'POST' && path === `/projects/${projSlug}/api-keys`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
-    const db = loadDb()
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const now = new Date().toISOString()
@@ -523,28 +593,28 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
     const secret = `sk_lane_dev_${makeToken()}`
     db.project_api_keys.push(keyObj)
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok({ key: keyObj, secret }, requestId))
   }
 
   // POST /projects/:slug/api-keys/:keyId/revoke
   if (projRes === 'api-keys' && projId3 && projId4 === 'revoke' && method === 'POST') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const key = db.project_api_keys.find(k => k.id === projId3 && k.projectId === proj.id)
     if (!key) return e(404, 'not_found', 'API key not found')
     key.status = 'revoked'
     key.revokedAt = new Date().toISOString()
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(key, requestId))
   }
 
   // GET /projects/:slug/environments
   if (projRes === 'environments' && !projId3 && method === 'GET' && path === `/projects/${projSlug}/environments`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     return r(200, ok(db.environments.filter(e => e.projectId === proj.id), requestId))
@@ -552,10 +622,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // POST /projects/:slug/environments
   if (projRes === 'environments' && !projId3 && method === 'POST' && path === `/projects/${projSlug}/environments`) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
-    const db = loadDb()
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const now = new Date().toISOString()
@@ -565,15 +635,15 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       deploymentTarget: payload.deploymentTarget || 'africa-west1', createdAt: now, updatedAt: now,
     }
     db.environments.push(env)
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(env, requestId))
   }
 
   // PATCH /projects/:slug/environments/:envId
   if (projRes === 'environments' && projId3 && !projId4 && method === 'PATCH') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
-    const db = loadDb()
+    const db = await loadDb()
     const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const env = db.environments.find(e => e.id === projId3 && e.projectId === proj.id)
@@ -582,7 +652,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (payload.region) env.region = payload.region
     if (payload.deploymentTarget) env.deploymentTarget = payload.deploymentTarget
     env.updatedAt = new Date().toISOString()
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok(env, requestId))
   }
 
@@ -590,8 +660,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /organizations/:slug/projects
   if (orgSlug && orgSub === 'projects' && method === 'GET') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const org = db.organizations.find(o => o.id === orgSlug || o.slug === orgSlug)
     if (!org) return e(404, 'not_found', 'Organization not found')
     return r(200, ok(db.projects.filter(p => p.organizationId === org.id), requestId))
@@ -599,8 +669,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /organizations/:slug/operations
   if (orgSlug && orgSub === 'operations' && method === 'GET') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = loadDb()
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = await loadDb()
     const org = db.organizations.find(o => o.id === orgSlug || o.slug === orgSlug)
     if (!org) return e(404, 'not_found', 'Organization not found')
     const projects = db.projects.filter(p => p.organizationId === org.id)
@@ -622,8 +692,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /api/v1/cloud/projects
   if (method === 'GET' && path === '/api/v1/cloud/projects') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = ensureCloudShape(loadDb())
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = ensureCloudShape(await loadDb())
     const list = db.cloud_projects
       .filter((p) => p.ownerId === user.id)
       .map((p) => {
@@ -643,10 +713,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // POST /api/v1/cloud/projects
   if (method === 'POST' && path === '/api/v1/cloud/projects') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
-    const db = ensureCloudShape(loadDb())
+    const db = ensureCloudShape(await loadDb())
     const now = new Date().toISOString()
     const slug = payload.slug || slugify(payload.name)
     if (db.cloud_projects.some((p) => p.slug === slug)) {
@@ -686,7 +756,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       metadata: { reason: 'new_project_free_credits' },
       createdAt: now,
     })
-    saveDb(db)
+    await saveDb(db)
     return r(201, ok({
       id: project.id,
       ownerId: project.ownerId,
@@ -702,8 +772,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (cloudProjMatch) {
     const projectRef = decodeURIComponent(cloudProjMatch[1])
     const rest = cloudProjMatch[2] || ''
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = ensureCloudShape(loadDb())
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = ensureCloudShape(await loadDb())
     const project = db.cloud_projects.find((p) => p.id === projectRef || p.slug === projectRef)
     if (!project) return e(404, 'not_found', 'Cloud project not found')
     if (project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
@@ -718,7 +788,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           lifetimeCredits: 0, lifetimeSpend: 0, freeCreditsGranted: false, createdAt: now, updatedAt: now,
         }
         db.wallets[project.id] = wallet
-        saveDb(db)
+        await saveDb(db)
       }
       const txs = db.transactions
         .filter((t) => t.walletId === wallet.id)
@@ -785,7 +855,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       }
       db.cloud_api_keys.push(key)
       db.api_keys[rawKey] = user.id
-      saveDb(db)
+      await saveDb(db)
       return r(201, ok({
         key: {
           id: key.id,
@@ -850,9 +920,9 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // POST /api/v1/cloud/api-keys/:id/revoke
   if (method === 'POST' && path.startsWith('/api/v1/cloud/api-keys/') && path.endsWith('/revoke')) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const keyId = decodeURIComponent(path.replace('/api/v1/cloud/api-keys/', '').replace('/revoke', ''))
-    const db = ensureCloudShape(loadDb())
+    const db = ensureCloudShape(await loadDb())
     const key = db.cloud_api_keys.find((k) => k.id === keyId)
     if (!key) return e(404, 'not_found', 'API key not found')
     const project = db.cloud_projects.find((p) => p.id === key.projectId)
@@ -860,7 +930,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     key.status = 'revoked'
     key.updatedAt = new Date().toISOString()
     if (key.rawKey) delete db.api_keys[key.rawKey]
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok({
       key: {
         id: key.id, projectId: key.projectId, name: key.name, prefix: key.prefix,
@@ -874,10 +944,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /api/v1/cloud/billing/wallet
   if (method === 'GET' && path.startsWith('/api/v1/cloud/billing/wallet')) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const projectId = query.projectId
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
-    const db = ensureCloudShape(loadDb())
+    const db = ensureCloudShape(await loadDb())
     const project = db.cloud_projects?.find((p) => p.id === projectId)
     if (project && project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
     const wallet = db.wallets[projectId]
@@ -897,25 +967,25 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GET /api/v1/cloud/billing/transactions
   if (method === 'GET' && path.startsWith('/api/v1/cloud/billing/transactions')) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
-    const db = loadDb()
+    const db = await loadDb()
     return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit), requestId))
   }
 
   // GET /api/v1/cloud/usage/events
   if (method === 'GET' && path.startsWith('/api/v1/cloud/usage/events')) {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
-    const db = loadDb()
+    const db = await loadDb()
     return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit), requestId))
   }
 
   // POST /api/v1/cloud/billing/topup — Lemon Squeezy when configured
   if (method === 'POST' && path === '/api/v1/cloud/billing/topup') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
     const rawAmount = Number(payload.amount ?? payload.amountUsd ?? 0)
@@ -925,7 +995,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (!Number.isFinite(credits) || credits < 500) {
       return e(422, 'minimum_topup', 'Minimum top-up is 500 credits ($5.00)')
     }
-    const db = ensureCloudShape(loadDb())
+    const db = ensureCloudShape(await loadDb())
     const project = db.cloud_projects.find((p) => p.id === payload.projectId)
     if (project && project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
     let wallet = db.wallets[payload.projectId]
@@ -936,7 +1006,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       id: topupId, projectId: payload.projectId, credits, amountUsd,
       status: 'pending', provider: 'lemonsqueezy', createdAt: now,
     })
-    saveDb(db)
+    await saveDb(db)
 
     let checkoutUrl = null
     const lsKey = process.env.LEMONSQUEEZY_API_KEY
@@ -1045,7 +1115,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const custom = event?.meta?.custom_data || {}
     const topupId = custom.topup_id || custom.topupId
     if (!topupId) return r(200, ok({ ignored: true, reason: 'no_topup_id' }, requestId))
-    const db = ensureCloudShape(loadDb())
+    const db = ensureCloudShape(await loadDb())
     const topup = db.topups.find((t) => t.id === topupId)
     if (!topup || topup.status === 'succeeded') {
       return r(200, ok({ already: true }, requestId))
@@ -1069,19 +1139,19 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       metadata: { provider: 'lemonsqueezy' },
       createdAt: now,
     })
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok({ credited: true, topupId, credits: topup.credits }, requestId))
   }
 
   // POST /api/v1/cloud/billing/topup/confirm
   if (method === 'POST' && path === '/api/v1/cloud/billing/topup/confirm') {
-    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     if (process.env.NODE_ENV === 'production' && process.env.TALOCODE_ALLOW_MANUAL_TOPUPS !== 'true') {
       return e(403, 'manual_disabled', 'Use Lemon Squeezy checkout; wallet is credited via webhook.')
     }
     const payload = jsonBody(body)
     if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
-    const db = loadDb()
+    const db = await loadDb()
     const wallet = db.wallets[payload.projectId]
     if (!wallet) return e(404, 'not_found', 'Wallet not found')
     const now = new Date().toISOString()
@@ -1093,7 +1163,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       balanceAfter: wallet.balance, product: null, action: 'topup', reference: payload.topupId || null,
       metadata: null, createdAt: now,
     })
-    saveDb(db)
+    await saveDb(db)
     return r(200, ok({
       topup: { id: payload.topupId || makeId('topup'), walletId: wallet.id, amount: payload.amount || 100, status: 'completed' },
       wallet,
@@ -1108,7 +1178,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const payload = jsonBody(body)
     if (!payload || !payload.action || !payload.credits) return e(400, 'invalid_request', 'action and credits are required')
     try {
-      const db = loadDb()
+      const db = await loadDb()
       const userId = db.api_keys[apiKey]
       if (!userId) return e(401, 'invalid_api_key', 'Invalid or expired API key')
       const profile = db.profiles[userId]
@@ -1117,7 +1187,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       if (total < payload.credits) return e(402, 'insufficient_credits', `Insufficient credits. Required: ${payload.credits}, Balance: ${total}`)
       profile.purchased_credits_balance -= payload.credits
       db.usage_events.push({ user_id: userId, product: payload.product || 'tera_api', action: payload.action, credits: payload.credits, metadata: payload.metadata || {}, created_at: new Date().toISOString() })
-      saveDb(db)
+      await saveDb(db)
       return r(200, ok({ ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } }, requestId))
     } catch (err) {
       return e(503, 'billing_unavailable', err.message)
@@ -1160,7 +1230,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
     // POST endpoints → require TALOCODE_API_KEY, then provider/proxy
     if (method === 'POST' && (sub === '/chat/completions' || sub === '/writing/rewrite' || sub === '/writing/draft' || sub === '/coding/explain' || sub === '/coding/review' || sub === '/coding/write')) {
-      const auth = requireApiKey(headers)
+      const auth = await requireApiKey(headers)
       if (!auth.ok) return e(auth.status, auth.code, auth.message)
       const payload = jsonBody(body)
       if (!payload) return e(400, 'invalid_request', 'Request body is required')
@@ -1234,7 +1304,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       return r(200, { ...getSearchLaneCapabilities(), meta: { requestId } })
     }
     if (method === 'POST' && (sub === '/query' || sub === '/news' || sub === '/research')) {
-      const auth = requireApiKey(headers)
+      const auth = await requireApiKey(headers)
       if (!auth.ok) return e(auth.status, auth.code, auth.message)
       const payload = jsonBody(body) || {}
       const query = typeof payload.query === 'string' ? payload.query.trim()
@@ -1247,7 +1317,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       const action = actionMap[sub]
       // Charge profile credits (JSON store)
       try {
-        const db = loadDb()
+        const db = await loadDb()
         const userId = auth.userId || db.api_keys[auth.key] || 'user-admin-001'
         const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
         const bal = profile.purchased_credits_balance || 0
@@ -1259,7 +1329,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           user_id: userId, product: 'searchlane', action, credits,
           metadata: { query, limit }, created_at: new Date().toISOString(), request_id: requestId,
         })
-        saveDb(db)
+        await saveDb(db)
         let result
         if (sub === '/query') result = await runSearchQuery(query, { limit })
         else if (sub === '/news') result = await runSearchNews(query, { limit })
@@ -1304,13 +1374,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       return r(200, { ...getCalcLaneCapabilities(), meta: { requestId } })
     }
     if (method === 'POST' && (sub === '/evaluate' || sub === '/dispatch')) {
-      const auth = requireApiKey(headers)
+      const auth = await requireApiKey(headers)
       if (!auth.ok) return e(auth.status, auth.code, auth.message)
       const payload = jsonBody(body) || {}
       const credits = 1
       const action = sub === '/evaluate' ? 'calclane.evaluate' : 'calclane.dispatch'
       try {
-        const db = loadDb()
+        const db = await loadDb()
         const userId = auth.userId || db.api_keys[auth.key] || 'user-admin-001'
         const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
         const bal = profile.purchased_credits_balance || 0
@@ -1325,7 +1395,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
             : { commandCount: Array.isArray(payload.commands) ? payload.commands.length : 0 },
           created_at: new Date().toISOString(), request_id: requestId,
         })
-        saveDb(db)
+        await saveDb(db)
 
         if (sub === '/evaluate') {
           const expression = typeof payload.expression === 'string' ? payload.expression
@@ -1415,7 +1485,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // ── Cloud health (expanded) ────────────────────────────────────────
   if ((method === 'GET') && (path === '/api/v1/cloud/health' || path === '/cloud/health')) {
-    const db = loadDb()
+    const db = await loadDb()
     return r(200, ok({ status: 'ok', service: 'stacklane-cloud', version: '0.6.0', dbSize: JSON.stringify(db).length, creditsAvailable: db.profiles['user-admin-001']?.purchased_credits_balance || 0, timestamp: new Date().toISOString() }, requestId))
   }
 
@@ -1430,7 +1500,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // OpenAI-compatible chat + router
   if (method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/router/chat/completions' || path === '/v1/tera/chat/completions')) {
-    const auth = requireApiKey(headers)
+    const auth = await requireApiKey(headers)
     if (!auth.ok) return e(auth.status, auth.code, auth.message)
     const payload = jsonBody(body) || {}
     const messages = payload.messages
@@ -1458,7 +1528,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // Tera writing rewrite (used by ScreenLane prompt polish)
   if (method === 'POST' && path === '/v1/tera/writing/rewrite') {
-    const auth = requireApiKey(headers)
+    const auth = await requireApiKey(headers)
     if (!auth.ok) return e(auth.status, auth.code, auth.message)
     const payload = jsonBody(body) || {}
     const text = payload.text || payload.prompt || ''
@@ -1479,7 +1549,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // Codra cloud actions
   if (method === 'POST' && (path === '/v1/codra/run' || path === '/v1/codra/repo-summary')) {
-    const auth = requireApiKey(headers)
+    const auth = await requireApiKey(headers)
     if (!auth.ok) return e(auth.status, auth.code, auth.message)
     const payload = jsonBody(body) || {}
     const prompt = payload.prompt || payload.text || ''
@@ -1500,7 +1570,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GateLane call passthrough stub (policy-aware later)
   if (method === 'POST' && path === '/v1/gatelane/call') {
-    const auth = requireApiKey(headers)
+    const auth = await requireApiKey(headers)
     if (!auth.ok) return e(auth.status, auth.code, auth.message)
     const payload = jsonBody(body) || {}
     return r(200, ok({
@@ -1526,7 +1596,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
   if (method === 'POST' && path === '/v1/screenlane/command') {
-    const auth = requireApiKey(headers)
+    const auth = await requireApiKey(headers)
     if (!auth.ok) return e(auth.status, auth.code, auth.message)
     const payload = jsonBody(body) || {}
     const instruction = payload.text || payload.instruction || ''
@@ -1560,7 +1630,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
   if (method === 'POST' && path === '/v1/screenlane/send') {
-    const auth = requireApiKey(headers)
+    const auth = await requireApiKey(headers)
     if (!auth.ok) return e(auth.status, auth.code, auth.message)
     const payload = jsonBody(body) || {}
     const text = payload.text || payload.commandText || payload.prompt || ''
