@@ -149,9 +149,20 @@ function jsonBody(body) {
 }
 
 function corsHeaders(origin) {
-  const allowed = ['https://stacklane.talocode.site', 'https://stacklane-web.netlify.app', origin].filter(Boolean)
+  const allowed = [
+    'https://dashboard.talocode.site',
+    'https://stacklane.talocode.site',
+    'https://stacklane-web.netlify.app',
+    'https://talocode.site',
+    'https://cloud.talocode.site',
+    'http://127.0.0.1:5173',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://localhost:3000',
+  ]
+  const match = origin && allowed.includes(origin) ? origin : (allowed.includes(origin) ? origin : null)
   return {
-    'Access-Control-Allow-Origin': allowed.find(o => o === origin) || 'https://stacklane.talocode.site',
+    'Access-Control-Allow-Origin': match || 'https://dashboard.talocode.site',
     'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key, X-Talocode-Api-Key, Cookie',
@@ -246,11 +257,53 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // ─── Auth ────────────────────────────────────────────────────────
 
+  if (method === 'POST' && path === '/auth/register') {
+    const payload = jsonBody(body)
+    if (!payload || !payload.email || !payload.password) {
+      return e(400, 'invalid_request', 'email and password are required')
+    }
+    if (String(payload.password).length < 8) {
+      return e(422, 'validation_error', 'Password must be at least 8 characters')
+    }
+    const email = String(payload.email).toLowerCase().trim()
+    const db = loadDb()
+    if (db.users.find((u) => u.email === email)) {
+      return e(409, 'email_taken', 'An account with this email already exists')
+    }
+    const now = new Date().toISOString()
+    const user = {
+      id: makeId('usr'),
+      email,
+      name: (payload.name && String(payload.name).trim()) || email.split('@')[0] || 'Talocode User',
+      password: String(payload.password),
+      status: 'active',
+      lastLoginAt: now,
+      createdAt: now,
+      updatedAt: now,
+    }
+    db.users.push(user)
+    db.profiles[user.id] = { purchased_credits_balance: 0, free_plan_credits_used: 0 }
+    const token = makeToken()
+    db.sessions[token] = { userId: user.id, createdAt: now }
+    saveDb(db)
+    const { password, ...safe } = user
+    return withCors({
+      statusCode: 201,
+      headers: {
+        'Content-Type': 'application/json',
+        'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
+        ...corsHeaders(origin),
+      },
+      body: JSON.stringify(ok(safe, requestId)),
+    }, origin)
+  }
+
   if (method === 'POST' && path === '/auth/login') {
     const payload = jsonBody(body)
     if (!payload || !payload.email || !payload.password) return e(400, 'invalid_request', 'email and password are required')
     const db = loadDb()
-    const user = db.users.find(u => u.email === payload.email)
+    const email = String(payload.email).toLowerCase().trim()
+    const user = db.users.find(u => u.email === email || u.email === payload.email)
     if (!user || user.password !== payload.password) return e(401, 'invalid_credentials', 'Invalid email or password')
     const token = makeToken()
     db.sessions[token] = { userId: user.id, createdAt: new Date().toISOString() }
@@ -261,7 +314,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       statusCode: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400`,
+        'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
         ...corsHeaders(origin),
       },
       body: JSON.stringify(ok(safe, requestId)),
@@ -558,6 +611,265 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return r(200, ok(rows, requestId))
   }
 
+  // ─── Talocode Cloud projects (dashboard) ─────────────────────────
+
+  function ensureCloudShape(db) {
+    if (!db.cloud_projects) db.cloud_projects = []
+    if (!db.cloud_api_keys) db.cloud_api_keys = []
+    if (!db.topups) db.topups = []
+    return db
+  }
+
+  // GET /api/v1/cloud/projects
+  if (method === 'GET' && path === '/api/v1/cloud/projects') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = ensureCloudShape(loadDb())
+    const list = db.cloud_projects
+      .filter((p) => p.ownerId === user.id)
+      .map((p) => {
+        const w = db.wallets[p.id]
+        return {
+          id: p.id,
+          ownerId: p.ownerId,
+          name: p.name,
+          slug: p.slug,
+          balanceCredits: w?.balance ?? 0,
+          createdAt: p.createdAt,
+          updatedAt: p.updatedAt,
+        }
+      })
+    return r(200, ok(list, requestId))
+  }
+
+  // POST /api/v1/cloud/projects
+  if (method === 'POST' && path === '/api/v1/cloud/projects') {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.name) return e(400, 'invalid_request', 'name is required')
+    const db = ensureCloudShape(loadDb())
+    const now = new Date().toISOString()
+    const slug = payload.slug || slugify(payload.name)
+    if (db.cloud_projects.some((p) => p.slug === slug)) {
+      return e(409, 'duplicate_slug', 'A project with this slug already exists')
+    }
+    const project = {
+      id: makeId('cprj'),
+      ownerId: user.id,
+      name: String(payload.name).trim(),
+      slug,
+      createdAt: now,
+      updatedAt: now,
+    }
+    db.cloud_projects.push(project)
+    // Free starting credits (100)
+    const freeCredits = 100
+    db.wallets[project.id] = {
+      id: makeId('cwal'),
+      projectId: project.id,
+      balance: freeCredits,
+      balanceCredits: freeCredits,
+      lifetimeCredits: freeCredits,
+      lifetimeSpend: 0,
+      freeCreditsGranted: true,
+      createdAt: now,
+      updatedAt: now,
+    }
+    db.transactions.push({
+      id: makeId('ctxn'),
+      walletId: db.wallets[project.id].id,
+      type: 'grant',
+      creditsDelta: freeCredits,
+      balanceAfter: freeCredits,
+      product: null,
+      action: null,
+      reference: 'free_credits_grant',
+      metadata: { reason: 'new_project_free_credits' },
+      createdAt: now,
+    })
+    saveDb(db)
+    return r(201, ok({
+      id: project.id,
+      ownerId: project.ownerId,
+      name: project.name,
+      slug: project.slug,
+      createdAt: project.createdAt,
+      updatedAt: project.updatedAt,
+    }, requestId))
+  }
+
+  // Cloud project nested routes: /api/v1/cloud/projects/:id/...
+  const cloudProjMatch = path.match(/^\/api\/v1\/cloud\/projects\/([^/]+)(?:\/(.+))?$/)
+  if (cloudProjMatch) {
+    const projectRef = decodeURIComponent(cloudProjMatch[1])
+    const rest = cloudProjMatch[2] || ''
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const db = ensureCloudShape(loadDb())
+    const project = db.cloud_projects.find((p) => p.id === projectRef || p.slug === projectRef)
+    if (!project) return e(404, 'not_found', 'Cloud project not found')
+    if (project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+
+    // GET /wallet
+    if (rest === 'wallet' && method === 'GET') {
+      let wallet = db.wallets[project.id]
+      if (!wallet) {
+        const now = new Date().toISOString()
+        wallet = {
+          id: makeId('cwal'), projectId: project.id, balance: 0, balanceCredits: 0,
+          lifetimeCredits: 0, lifetimeSpend: 0, freeCreditsGranted: false, createdAt: now, updatedAt: now,
+        }
+        db.wallets[project.id] = wallet
+        saveDb(db)
+      }
+      const txs = db.transactions
+        .filter((t) => t.walletId === wallet.id)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, 50)
+        .map((t) => ({
+          id: t.id,
+          walletId: t.walletId,
+          type: t.type,
+          creditsDelta: t.creditsDelta,
+          balanceAfter: t.balanceAfter,
+          reference: t.reference,
+          metadata: t.metadata,
+          createdAt: t.createdAt,
+        }))
+      return r(200, ok({
+        wallet: {
+          id: wallet.id,
+          projectId: project.id,
+          balanceCredits: wallet.balance ?? wallet.balanceCredits ?? 0,
+          freeCreditsGranted: !!wallet.freeCreditsGranted,
+          createdAt: wallet.createdAt,
+          updatedAt: wallet.updatedAt,
+        },
+        transactions: txs,
+      }, requestId))
+    }
+
+    // GET|POST /api-keys
+    if (rest === 'api-keys' && method === 'GET') {
+      const keys = db.cloud_api_keys.filter((k) => k.projectId === project.id)
+      return r(200, ok(keys.map((k) => ({
+        id: k.id,
+        projectId: k.projectId,
+        name: k.name,
+        prefix: k.prefix,
+        mode: k.mode,
+        status: k.status,
+        lastUsedAt: k.lastUsedAt,
+        createdAt: k.createdAt,
+        updatedAt: k.updatedAt,
+      })), requestId))
+    }
+
+    if (rest === 'api-keys' && method === 'POST') {
+      const payload = jsonBody(body) || {}
+      const name = (payload.name && String(payload.name).trim()) || 'API Key'
+      const mode = payload.mode === 'dev' ? 'dev' : 'live'
+      const now = new Date().toISOString()
+      const prefix = `tk_${mode}_${randomBytes(3).toString('hex')}`
+      const secret = randomBytes(24).toString('hex')
+      const rawKey = `${prefix}.${secret}`
+      const key = {
+        id: makeId('ckey'),
+        projectId: project.id,
+        name,
+        prefix,
+        mode,
+        status: 'active',
+        rawKey, // only for local JSON store; never re-list
+        lastUsedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      }
+      db.cloud_api_keys.push(key)
+      db.api_keys[rawKey] = user.id
+      saveDb(db)
+      return r(201, ok({
+        key: {
+          id: key.id,
+          projectId: key.projectId,
+          name: key.name,
+          prefix: key.prefix,
+          mode: key.mode,
+          status: key.status,
+          lastUsedAt: null,
+          createdAt: key.createdAt,
+          updatedAt: key.updatedAt,
+        },
+        rawKey,
+      }, requestId))
+    }
+
+    // GET usage
+    if (rest === 'usage' && method === 'GET') {
+      const events = db.usage_events
+        .filter((ev) => ev.project_id === project.id || ev.user_id === user.id)
+        .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+        .slice(0, 100)
+        .map((ev) => ({
+          id: ev.id || makeId('ue'),
+          projectId: project.id,
+          apiKeyId: ev.api_key_id || null,
+          product: ev.product,
+          action: ev.action,
+          credits: ev.credits,
+          status: ev.status || 'charged',
+          createdAt: ev.created_at,
+        }))
+      return r(200, ok(events, requestId))
+    }
+
+    if (rest === 'usage/summary' && method === 'GET') {
+      const events = db.usage_events.filter((ev) => ev.project_id === project.id || ev.user_id === user.id)
+      const map = {}
+      for (const ev of events) {
+        const k = `${ev.product}|${ev.action}`
+        if (!map[k]) map[k] = { product: ev.product, action: ev.action, total_credits: 0, event_count: 0 }
+        map[k].total_credits += ev.credits || 0
+        map[k].event_count += 1
+      }
+      return r(200, ok(Object.values(map), requestId))
+    }
+
+    // GET project
+    if (!rest && method === 'GET') {
+      const w = db.wallets[project.id]
+      return r(200, ok({
+        id: project.id,
+        ownerId: project.ownerId,
+        name: project.name,
+        slug: project.slug,
+        balanceCredits: w?.balance ?? 0,
+        createdAt: project.createdAt,
+        updatedAt: project.updatedAt,
+      }, requestId))
+    }
+  }
+
+  // POST /api/v1/cloud/api-keys/:id/revoke
+  if (method === 'POST' && path.startsWith('/api/v1/cloud/api-keys/') && path.endsWith('/revoke')) {
+    const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const keyId = decodeURIComponent(path.replace('/api/v1/cloud/api-keys/', '').replace('/revoke', ''))
+    const db = ensureCloudShape(loadDb())
+    const key = db.cloud_api_keys.find((k) => k.id === keyId)
+    if (!key) return e(404, 'not_found', 'API key not found')
+    const project = db.cloud_projects.find((p) => p.id === key.projectId)
+    if (!project || project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    key.status = 'revoked'
+    key.updatedAt = new Date().toISOString()
+    if (key.rawKey) delete db.api_keys[key.rawKey]
+    saveDb(db)
+    return r(200, ok({
+      key: {
+        id: key.id, projectId: key.projectId, name: key.name, prefix: key.prefix,
+        mode: key.mode, status: key.status, lastUsedAt: key.lastUsedAt,
+        createdAt: key.createdAt, updatedAt: key.updatedAt,
+      },
+    }, requestId))
+  }
+
   // ─── Cloud Billing ───────────────────────────────────────────────
 
   // GET /api/v1/cloud/billing/wallet
@@ -565,10 +877,22 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const projectId = query.projectId
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
-    const db = loadDb()
+    const db = ensureCloudShape(loadDb())
+    const project = db.cloud_projects?.find((p) => p.id === projectId)
+    if (project && project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
     const wallet = db.wallets[projectId]
     if (!wallet) return e(404, 'not_found', 'Wallet not found')
-    return r(200, ok(wallet, requestId))
+    return r(200, ok({
+      id: wallet.id,
+      projectId,
+      balance: wallet.balance ?? 0,
+      balanceCredits: wallet.balance ?? 0,
+      lifetimeCredits: wallet.lifetimeCredits ?? 0,
+      lifetimeSpend: wallet.lifetimeSpend ?? 0,
+      freeCreditsGranted: !!wallet.freeCreditsGranted,
+      createdAt: wallet.createdAt,
+      updatedAt: wallet.updatedAt,
+    }, requestId))
   }
 
   // GET /api/v1/cloud/billing/transactions
@@ -589,25 +913,172 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit), requestId))
   }
 
-  // POST /api/v1/cloud/billing/topup
+  // POST /api/v1/cloud/billing/topup — Lemon Squeezy when configured
   if (method === 'POST' && path === '/api/v1/cloud/billing/topup') {
     const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
-    if (!payload || !payload.projectId || !payload.amount) return e(400, 'invalid_request', 'projectId and amount are required')
-    const db = loadDb()
-    const wallet = db.wallets[payload.projectId]
+    if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
+    const rawAmount = Number(payload.amount ?? payload.amountUsd ?? 0)
+    // amount >= 100 treated as credits
+    const credits = rawAmount >= 100 ? Math.floor(rawAmount) : Math.floor(rawAmount * 100)
+    const amountUsd = credits / 100
+    if (!Number.isFinite(credits) || credits < 500) {
+      return e(422, 'minimum_topup', 'Minimum top-up is 500 credits ($5.00)')
+    }
+    const db = ensureCloudShape(loadDb())
+    const project = db.cloud_projects.find((p) => p.id === payload.projectId)
+    if (project && project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    let wallet = db.wallets[payload.projectId]
     if (!wallet) return e(404, 'not_found', 'Wallet not found')
-    const topupId = makeId('topup')
-    return r(200, ok({
-      topup: { id: topupId, walletId: wallet.id, amount: payload.amount, status: 'pending' },
+    const topupId = makeId('ctup')
+    const now = new Date().toISOString()
+    db.topups.push({
+      id: topupId, projectId: payload.projectId, credits, amountUsd,
+      status: 'pending', provider: 'lemonsqueezy', createdAt: now,
+    })
+    saveDb(db)
+
+    let checkoutUrl = null
+    const lsKey = process.env.LEMONSQUEEZY_API_KEY
+    const lsStore = process.env.LEMONSQUEEZY_STORE_ID
+    const lsVariant = process.env.LEMONSQUEEZY_VARIANT_ID
+    let variantMap = {}
+    try {
+      if (process.env.LEMONSQUEEZY_VARIANT_MAP) variantMap = JSON.parse(process.env.LEMONSQUEEZY_VARIANT_MAP)
+    } catch { /* ignore */ }
+    const variantId = variantMap[String(credits)] || lsVariant
+
+    if (lsKey && lsStore && variantId) {
+      try {
+        const successUrl =
+          process.env.TALOCODE_CLOUD_SUCCESS_URL ||
+          'https://dashboard.talocode.site/billing?topup=success'
+        const attributes = {
+          checkout_options: { embed: false, media: false, logo: true },
+          checkout_data: {
+            email: user.email,
+            custom: {
+              topup_id: topupId,
+              project_id: payload.projectId,
+              credits: String(credits),
+              amount_usd: String(amountUsd),
+              provider: 'lemonsqueezy',
+            },
+          },
+          product_options: {
+            name: `Talocode Cloud — ${credits.toLocaleString()} credits`,
+            description: `${credits.toLocaleString()} prepaid credits (1 credit = $0.01).`,
+            redirect_url: successUrl,
+            receipt_button_text: 'Return to dashboard',
+            receipt_link_url: successUrl,
+          },
+          test_mode: process.env.LEMONSQUEEZY_TEST_MODE === 'true',
+        }
+        if (!variantMap[String(credits)]) {
+          attributes.custom_price = Math.round(amountUsd * 100)
+        }
+        const lsRes = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
+          method: 'POST',
+          headers: {
+            Accept: 'application/vnd.api+json',
+            'Content-Type': 'application/vnd.api+json',
+            Authorization: `Bearer ${lsKey}`,
+          },
+          body: JSON.stringify({
+            data: {
+              type: 'checkouts',
+              attributes,
+              relationships: {
+                store: { data: { type: 'stores', id: String(lsStore) } },
+                variant: { data: { type: 'variants', id: String(variantId) } },
+              },
+            },
+          }),
+        })
+        const lsJson = await lsRes.json().catch(() => ({}))
+        checkoutUrl = lsJson?.data?.attributes?.url || null
+        if (!lsRes.ok) {
+          const detail = lsJson?.errors?.map((x) => x.detail || x.title).filter(Boolean).join('; ')
+          return e(502, 'lemonsqueezy_checkout_failed', detail || 'Lemon Squeezy checkout failed')
+        }
+      } catch (err) {
+        return e(502, 'lemonsqueezy_checkout_failed', err.message)
+      }
+    }
+
+    return r(201, ok({
+      topup: { id: topupId, walletId: wallet.id, amount: credits, status: 'pending' },
+      checkoutUrl,
+      lemonsqueezy: checkoutUrl ? { checkoutUrl } : null,
       stripePublishableKey: null,
       clientSecret: null,
+      creditsPerDollar: 100,
     }, requestId))
+  }
+
+  // Lemon Squeezy webhook
+  if (method === 'POST' && path === '/api/v1/cloud/billing/lemonsqueezy/webhook') {
+    const raw = typeof body === 'string' ? body : JSON.stringify(body || {})
+    const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET
+    const sig = headers['x-signature'] || headers['X-Signature']
+    if (secret && sig) {
+      const { createHmac, timingSafeEqual } = await import('node:crypto')
+      const digest = createHmac('sha256', secret).update(raw).digest('hex')
+      try {
+        const a = Buffer.from(digest)
+        const b = Buffer.from(String(sig))
+        if (a.length !== b.length || !timingSafeEqual(a, b)) {
+          return e(400, 'invalid_signature', 'Invalid Lemon Squeezy webhook signature')
+        }
+      } catch {
+        return e(400, 'invalid_signature', 'Invalid Lemon Squeezy webhook signature')
+      }
+    }
+    let event
+    try { event = typeof body === 'string' ? JSON.parse(body) : body } catch {
+      return e(400, 'invalid_payload', 'Invalid JSON')
+    }
+    const name = event?.meta?.event_name || ''
+    if (!['order_created', 'order_paid', 'subscription_payment_success'].includes(name)) {
+      return r(200, ok({ ignored: true }, requestId))
+    }
+    const custom = event?.meta?.custom_data || {}
+    const topupId = custom.topup_id || custom.topupId
+    if (!topupId) return r(200, ok({ ignored: true, reason: 'no_topup_id' }, requestId))
+    const db = ensureCloudShape(loadDb())
+    const topup = db.topups.find((t) => t.id === topupId)
+    if (!topup || topup.status === 'succeeded') {
+      return r(200, ok({ already: true }, requestId))
+    }
+    const wallet = db.wallets[topup.projectId]
+    if (!wallet) return e(404, 'not_found', 'Wallet not found')
+    const now = new Date().toISOString()
+    wallet.balance = (wallet.balance || 0) + topup.credits
+    wallet.lifetimeCredits = (wallet.lifetimeCredits || 0) + topup.credits
+    wallet.updatedAt = now
+    topup.status = 'succeeded'
+    db.transactions.push({
+      id: makeId('ctxn'),
+      walletId: wallet.id,
+      type: 'topup',
+      creditsDelta: topup.credits,
+      balanceAfter: wallet.balance,
+      product: null,
+      action: 'topup',
+      reference: topupId,
+      metadata: { provider: 'lemonsqueezy' },
+      createdAt: now,
+    })
+    saveDb(db)
+    return r(200, ok({ credited: true, topupId, credits: topup.credits }, requestId))
   }
 
   // POST /api/v1/cloud/billing/topup/confirm
   if (method === 'POST' && path === '/api/v1/cloud/billing/topup/confirm') {
     const user = requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    if (process.env.NODE_ENV === 'production' && process.env.TALOCODE_ALLOW_MANUAL_TOPUPS !== 'true') {
+      return e(403, 'manual_disabled', 'Use Lemon Squeezy checkout; wallet is credited via webhook.')
+    }
     const payload = jsonBody(body)
     if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = loadDb()
