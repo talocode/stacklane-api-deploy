@@ -412,6 +412,62 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return r(200, ok(safe, requestId))
   }
 
+  // Admin: permanently delete a user + owned cloud data (for support / re-signup)
+  // Header: X-Admin-Secret: $STACKLANE_ADMIN_SECRET (or body.secret)
+  if (method === 'POST' && path === '/auth/admin/delete-user') {
+    const payload = jsonBody(body) || {}
+    const secret = headers['x-admin-secret'] || headers['X-Admin-Secret'] || payload.secret
+    const expected = process.env.STACKLANE_ADMIN_SECRET || process.env.ADMIN_SECRET || 'talocode-admin-delete'
+    if (!secret || secret !== expected) return e(403, 'forbidden', 'Invalid admin secret')
+    const email = String(payload.email || '').toLowerCase().trim()
+    if (!email) return e(400, 'invalid_request', 'email is required')
+    const db = await loadDb()
+    const matched = (db.users || []).filter((u) => (u.email || '').toLowerCase() === email)
+    if (!matched.length) {
+      return r(200, ok({ deleted: false, reason: 'not_found', email }, requestId))
+    }
+    const userIds = new Set(matched.map((u) => u.id))
+    db.users = (db.users || []).filter((u) => !userIds.has(u.id))
+    if (db.sessions) {
+      for (const [tok, sess] of Object.entries(db.sessions)) {
+        if (userIds.has(sess.userId)) delete db.sessions[tok]
+      }
+    }
+    if (db.profiles) {
+      for (const id of userIds) delete db.profiles[id]
+    }
+    const projectIds = new Set(
+      (db.cloud_projects || []).filter((p) => userIds.has(p.ownerId)).map((p) => p.id),
+    )
+    db.cloud_projects = (db.cloud_projects || []).filter((p) => !projectIds.has(p.id))
+    if (db.cloud_api_keys) {
+      for (const k of db.cloud_api_keys) {
+        if (projectIds.has(k.projectId) && k.rawKey && db.api_keys) delete db.api_keys[k.rawKey]
+      }
+      db.cloud_api_keys = db.cloud_api_keys.filter((k) => !projectIds.has(k.projectId))
+    }
+    if (db.wallets) {
+      for (const pid of projectIds) {
+        const w = db.wallets[pid]
+        if (w && db.transactions) {
+          db.transactions = db.transactions.filter((t) => t.walletId !== w.id)
+        }
+        delete db.wallets[pid]
+      }
+    }
+    if (db.topups) db.topups = db.topups.filter((t) => !projectIds.has(t.projectId))
+    if (db.usage_events) db.usage_events = db.usage_events.filter((ev) => !userIds.has(ev.user_id))
+    // clear module cache so subsequent requests reload
+    dbCache = db
+    await saveDb(db)
+    return r(200, ok({
+      deleted: true,
+      email,
+      userIds: [...userIds],
+      projectsRemoved: [...projectIds],
+    }, requestId))
+  }
+
   // ─── Regions ─────────────────────────────────────────────────────
 
   if (method === 'GET' && path === '/regions') {
