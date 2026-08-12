@@ -44,16 +44,14 @@ async function ensurePostgres() {
 function seedDb() {
   const now = new Date().toISOString()
   return {
-    users: [
-      { id: 'user-admin-001', email: 'admin@stacklane.local', name: 'Admin', password: 'stacklane-admin', status: 'active', lastLoginAt: null, createdAt: now, updatedAt: now },
-    ],
+    users: [],
     sessions: {},
-    api_keys: { 'sk-dev-talocode': 'user-admin-001' },
+    api_keys: {},
     project_api_keys: [],
     cloud_projects: [],
     cloud_api_keys: [],
     topups: [],
-    profiles: { 'user-admin-001': { purchased_credits_balance: 10000, free_plan_credits_used: 0 } },
+    profiles: {},
     usage_events: [],
     regions: [
       { id: 'reg-ng-lagos', code: 'ng-lagos', name: 'Lagos, Nigeria', marketScope: 'africa-west', deploymentTarget: 'africa-west1', isActive: true, createdAt: now, updatedAt: now },
