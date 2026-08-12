@@ -1,5 +1,5 @@
 [build]
-  command = "npm install && mkdir -p public && echo 'OK' > public/index.html"
+  command = "corepack enable && pnpm install --frozen-lockfile && pnpm run build"
   functions = "netlify/functions"
   publish = "public"
 

@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.18.0",
+  "scripts": {
+    "build": "test -f public/index.html"
+  },
   "dependencies": {
     "@netlify/blobs": "^9.1.1",
     "pg": "^8.16.3"

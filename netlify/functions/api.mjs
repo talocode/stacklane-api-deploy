@@ -234,10 +234,10 @@ async function requireApiKey(headers) {
   const key = extractApiKey(headers)
   if (!key) return { ok: false, status: 401, code: 'missing_api_key', message: 'API key required. Use Authorization: Bearer <TALOCODE_API_KEY>' }
   const db = await loadDb()
-  // Accept: DB keys, env TALOCODE_API_KEY, or sk-dev-talocode
+  // Accept database-backed keys or the explicitly configured emergency key.
   const envKey = process.env.TALOCODE_API_KEY
   const keyOwner = db.api_keys[`sha256:${hashApiKey(key)}`]
-  if (keyOwner || (envKey && key === envKey) || key === 'sk-dev-talocode') {
+  if (keyOwner || (envKey && key === envKey)) {
     return { ok: true, key, userId: keyOwner || 'user-admin-001' }
   }
   return { ok: false, status: 401, code: 'invalid_api_key', message: 'Invalid API key' }
@@ -266,7 +266,7 @@ async function providerChat(messages, model) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.TERA_UPSTREAM_KEY || 'sk-dev-talocode'}`,
+        Authorization: `Bearer ${process.env.TERA_UPSTREAM_KEY || ''}`,
       },
       body: JSON.stringify({ model: model || 'default', messages }),
     })
@@ -512,7 +512,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (method === 'POST' && path === '/auth/admin/delete-user') {
     const payload = jsonBody(body) || {}
     const secret = headers['x-admin-secret'] || headers['X-Admin-Secret'] || payload.secret
-    const expected = process.env.STACKLANE_ADMIN_SECRET || process.env.ADMIN_SECRET || 'talocode-admin-delete'
+    const expected = process.env.STACKLANE_ADMIN_SECRET || process.env.ADMIN_SECRET
     if (!secret || secret !== expected) return e(403, 'forbidden', 'Invalid admin secret')
     const email = String(payload.email || '').toLowerCase().trim()
     if (!email) return e(400, 'invalid_request', 'email is required')
@@ -1171,9 +1171,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
     if (lsKey && lsStore && variantId) {
       try {
-        const successUrl =
-          process.env.TALOCODE_CLOUD_SUCCESS_URL ||
-          'https://dashboard.talocode.site/billing?topup=success'
+        const successUrl = 'https://dashboard.talocode.site/billing?topup=success'
         const attributes = {
           checkout_options: { embed: false, media: false, logo: true },
           checkout_data: {
@@ -1243,7 +1241,6 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET
     const sig = headers['x-signature'] || headers['X-Signature']
     if (secret && sig) {
-      const { createHmac, timingSafeEqual } = await import('node:crypto')
       const digest = createHmac('sha256', secret).update(raw).digest('hex')
       try {
         const a = Buffer.from(digest)
