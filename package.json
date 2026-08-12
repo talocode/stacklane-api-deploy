@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@netlify/blobs": "^9.1.1"
+    "@netlify/blobs": "^9.1.1",
+    "pg": "^8.16.3"
   }
 }

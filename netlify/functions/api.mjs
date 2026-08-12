@@ -1,12 +1,52 @@
-import { randomUUID, randomBytes } from 'node:crypto'
+import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto'
 import fs from 'node:fs'
+import pg from 'pg'
 
 const DB_PATH = '/tmp/stacklane-db.json'
 const BLOB_STORE = 'stacklane-cloud'
 const BLOB_KEY = 'main-db'
+const POSTGRES_STATE_ID = 'primary'
+const { Pool } = pg
 
 /** @type {any} */
 let dbCache = null
+let pool = null
+let postgresReady = null
+
+function getPool() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL must be configured for persistent API storage.')
+  }
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 1,
+      idleTimeoutMillis: 10_000,
+    })
+  }
+  return pool
+}
+
+async function ensurePostgres() {
+  if (!postgresReady) {
+    postgresReady = (async () => {
+      const client = await getPool().connect()
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS stacklane_api_state (
+            id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          )
+        `)
+      } finally {
+        client.release()
+      }
+    })()
+  }
+  return postgresReady
+}
 
 function seedDb() {
   const now = new Date().toISOString()
@@ -70,6 +110,19 @@ async function initBlobs() {
 
 async function loadDb() {
   if (dbCache) return dbCache
+  await ensurePostgres()
+  const database = getPool()
+  const stored = await database.query(
+    'SELECT payload FROM stacklane_api_state WHERE id = $1',
+    [POSTGRES_STATE_ID],
+  )
+  if (stored.rows[0]?.payload && Array.isArray(stored.rows[0].payload.users)) {
+    dbCache = stored.rows[0].payload
+    if (normalizeStoredSecrets(dbCache)) await saveDb(dbCache)
+    return dbCache
+  }
+
+  // One-time migration path for the prototype Blob store. Postgres is authoritative after this write.
   await initBlobs()
   const store = getBlobStore()
   if (store) {
@@ -77,8 +130,8 @@ async function loadDb() {
       const data = await store.get(BLOB_KEY, { type: 'json' })
       if (data && Array.isArray(data.users)) {
         dbCache = data
-        // warm /tmp cache for same instance
-        try { fs.writeFileSync(DB_PATH, JSON.stringify(dbCache)) } catch { /* ignore */ }
+        normalizeStoredSecrets(dbCache)
+        await saveDb(dbCache)
         return dbCache
       }
     } catch (err) {
@@ -97,24 +150,63 @@ async function loadDb() {
 
 async function saveDb(db) {
   dbCache = db
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(db))
-  } catch {
-    /* ignore */
-  }
-  await initBlobs()
-  const store = getBlobStore()
-  if (store) {
-    try {
-      await store.setJSON(BLOB_KEY, db)
-    } catch (err) {
-      console.error('[db] blob save failed', err?.message || err)
-    }
-  }
+  await ensurePostgres()
+  await getPool().query(
+    `INSERT INTO stacklane_api_state (id, payload, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+    [POSTGRES_STATE_ID, JSON.stringify(db)],
+  )
 }
 
 function makeToken() {
   return randomBytes(32).toString('hex')
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16).toString('hex')
+  return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`
+}
+
+function verifyPassword(password, encoded) {
+  if (!encoded || !encoded.includes(':')) return false
+  const [salt, digest] = encoded.split(':')
+  const candidate = scryptSync(password, salt, 64)
+  const expected = Buffer.from(digest, 'hex')
+  return candidate.length === expected.length && timingSafeEqual(candidate, expected)
+}
+
+function hashApiKey(key) {
+  return createHash('sha256').update(key).digest('hex')
+}
+
+function normalizeStoredSecrets(db) {
+  let changed = false
+  for (const user of db.users || []) {
+    if (user.password) {
+      user.passwordHash = hashPassword(user.password)
+      delete user.password
+      changed = true
+    }
+  }
+  for (const key of db.cloud_api_keys || []) {
+    if (key.rawKey) {
+      key.keyHash = hashApiKey(key.rawKey)
+      delete key.rawKey
+      changed = true
+    }
+  }
+  if (db.api_keys && Object.keys(db.api_keys).some((key) => !key.startsWith('sha256:'))) {
+    db.api_keys = Object.fromEntries(
+      Object.entries(db.api_keys).map(([key, userId]) => [`sha256:${hashApiKey(key)}`, userId]),
+    )
+    changed = true
+  }
+  if (Object.keys(db.sessions || {}).length) {
+    db.sessions = {}
+    changed = true
+  }
+  return changed
 }
 
 function makeId(prefix) {
@@ -144,8 +236,9 @@ async function requireApiKey(headers) {
   const db = await loadDb()
   // Accept: DB keys, env TALOCODE_API_KEY, or sk-dev-talocode
   const envKey = process.env.TALOCODE_API_KEY
-  if (db.api_keys[key] || (envKey && key === envKey) || key === 'sk-dev-talocode') {
-    return { ok: true, key, userId: db.api_keys[key] || 'user-admin-001' }
+  const keyOwner = db.api_keys[`sha256:${hashApiKey(key)}`]
+  if (keyOwner || (envKey && key === envKey) || key === 'sk-dev-talocode') {
+    return { ok: true, key, userId: keyOwner || 'user-admin-001' }
   }
   return { ok: false, status: 401, code: 'invalid_api_key', message: 'Invalid API key' }
 }
@@ -208,7 +301,7 @@ async function authenticate(headers) {
   const token = extractSession(headers)
   if (!token) return null
   const db = await loadDb()
-  const session = db.sessions[token]
+  const session = db.sessions[hashApiKey(token)]
   if (!session) return null
   const user = db.users.find(u => u.id === session.userId)
   return user || null
@@ -216,6 +309,11 @@ async function authenticate(headers) {
 
 function jsonBody(body) {
   try { return typeof body === 'string' ? JSON.parse(body) : body } catch { return null }
+}
+
+function toSafeUser(user) {
+  const { password, passwordHash, ...safe } = user
+  return safe
 }
 
 function corsHeaders(origin) {
@@ -345,7 +443,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       id: makeId('usr'),
       email,
       name: (payload.name && String(payload.name).trim()) || email.split('@')[0] || 'Talocode User',
-      password: String(payload.password),
+      passwordHash: hashPassword(String(payload.password)),
       status: 'active',
       lastLoginAt: now,
       createdAt: now,
@@ -354,9 +452,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     db.users.push(user)
     db.profiles[user.id] = { purchased_credits_balance: 0, free_plan_credits_used: 0 }
     const token = makeToken()
-    db.sessions[token] = { userId: user.id, createdAt: now }
+    db.sessions[hashApiKey(token)] = { userId: user.id, createdAt: now }
     await saveDb(db)
-    const { password, ...safe } = user
     return withCors({
       statusCode: 201,
       headers: {
@@ -364,7 +461,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
         ...corsHeaders(origin),
       },
-      body: JSON.stringify(ok(safe, requestId)),
+      body: JSON.stringify(ok(toSafeUser(user), requestId)),
     }, origin)
   }
 
@@ -374,12 +471,11 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const db = await loadDb()
     const email = String(payload.email).toLowerCase().trim()
     const user = db.users.find(u => u.email === email || u.email === payload.email)
-    if (!user || user.password !== payload.password) return e(401, 'invalid_credentials', 'Invalid email or password')
+    if (!user || !verifyPassword(String(payload.password), user.passwordHash)) return e(401, 'invalid_credentials', 'Invalid email or password')
     const token = makeToken()
-    db.sessions[token] = { userId: user.id, createdAt: new Date().toISOString() }
+    db.sessions[hashApiKey(token)] = { userId: user.id, createdAt: new Date().toISOString() }
     user.lastLoginAt = new Date().toISOString()
     await saveDb(db)
-    const { password, ...safe } = user
     return withCors({
       statusCode: 200,
       headers: {
@@ -387,13 +483,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
         ...corsHeaders(origin),
       },
-      body: JSON.stringify(ok(safe, requestId)),
+      body: JSON.stringify(ok(toSafeUser(user), requestId)),
     }, origin)
   }
 
   if (method === 'POST' && path === '/auth/logout') {
     const token = extractSession(headers)
-    if (token) { const db = await loadDb(); delete db.sessions[token]; await saveDb(db) }
+    if (token) { const db = await loadDb(); delete db.sessions[hashApiKey(token)]; await saveDb(db) }
     return withCors({
       statusCode: 200,
       headers: {
@@ -408,8 +504,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (method === 'GET' && path === '/auth/me') {
     const user = await requireAuth()
     if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const { password, ...safe } = user
-    return r(200, ok(safe, requestId))
+    return r(200, ok(toSafeUser(user), requestId))
   }
 
   // Admin: permanently delete a user + owned cloud data (for support / re-signup)
@@ -442,7 +537,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     db.cloud_projects = (db.cloud_projects || []).filter((p) => !projectIds.has(p.id))
     if (db.cloud_api_keys) {
       for (const k of db.cloud_api_keys) {
-        if (projectIds.has(k.projectId) && k.rawKey && db.api_keys) delete db.api_keys[k.rawKey]
+        if (projectIds.has(k.projectId) && k.keyHash && db.api_keys) delete db.api_keys[`sha256:${k.keyHash}`]
       }
       db.cloud_api_keys = db.cloud_api_keys.filter((k) => !projectIds.has(k.projectId))
     }
@@ -904,13 +999,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         prefix,
         mode,
         status: 'active',
-        rawKey, // only for local JSON store; never re-list
+        keyHash: hashApiKey(rawKey),
         lastUsedAt: null,
         createdAt: now,
         updatedAt: now,
       }
       db.cloud_api_keys.push(key)
-      db.api_keys[rawKey] = user.id
+      db.api_keys[`sha256:${key.keyHash}`] = user.id
       await saveDb(db)
       return r(201, ok({
         key: {
@@ -985,7 +1080,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (!project || project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
     key.status = 'revoked'
     key.updatedAt = new Date().toISOString()
-    if (key.rawKey) delete db.api_keys[key.rawKey]
+    if (key.keyHash) delete db.api_keys[`sha256:${key.keyHash}`]
     await saveDb(db)
     return r(200, ok({
       key: {
@@ -1235,7 +1330,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (!payload || !payload.action || !payload.credits) return e(400, 'invalid_request', 'action and credits are required')
     try {
       const db = await loadDb()
-      const userId = db.api_keys[apiKey]
+      const userId = db.api_keys[`sha256:${hashApiKey(apiKey)}`]
       if (!userId) return e(401, 'invalid_api_key', 'Invalid or expired API key')
       const profile = db.profiles[userId]
       if (!profile) return e(402, 'insufficient_credits', 'No active subscription or credits found')
@@ -1374,7 +1469,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       // Charge profile credits (JSON store)
       try {
         const db = await loadDb()
-        const userId = auth.userId || db.api_keys[auth.key] || 'user-admin-001'
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
         const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
         const bal = profile.purchased_credits_balance || 0
         if (bal < credits) {
@@ -1437,7 +1532,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       const action = sub === '/evaluate' ? 'calclane.evaluate' : 'calclane.dispatch'
       try {
         const db = await loadDb()
-        const userId = auth.userId || db.api_keys[auth.key] || 'user-admin-001'
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
         const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
         const bal = profile.purchased_credits_balance || 0
         if (bal < credits) {
