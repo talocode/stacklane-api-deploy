@@ -67,7 +67,7 @@ function seedDb() {
     provisioning_tasks: [],
     provisioning_attempts: [],
     audit_events: [],
-    wallets: { 'proj-tera-api': { id: 'wallet-tera', projectId: 'proj-tera-api', balance: 5000, lifetimeCredits: 5000, lifetimeSpend: 0, freeCreditsGranted: true, createdAt: now, updatedAt: now } },
+    wallets: {},
     transactions: [],
   }
 }
@@ -1896,7 +1896,8 @@ export async function handler(event) {
   const queryParams = event.queryStringParameters || {}
   try {
     return await routeHandler(method, path, headers, body, queryParams)
-  } catch {
+  } catch (error) {
+    console.error('[storage]', error instanceof Error ? error.message : 'unknown storage error')
     const requestId = makeRequestId()
     const origin = headers.origin || headers.Origin || ''
     return withCors(respond(503, fail('storage_unavailable', 'Persistent storage is temporarily unavailable.', requestId)), origin)
