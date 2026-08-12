@@ -238,6 +238,17 @@ function normalizeStoredSecrets(db) {
     db.sessions = {}
     changed = true
   }
+  const validUserIds = new Set((db.users || []).filter((user) => user.passwordHash).map((user) => user.id))
+  if ((db.users || []).length !== validUserIds.size) {
+    db.users = db.users.filter((user) => validUserIds.has(user.id))
+    const projectIds = new Set((db.cloud_projects || []).filter((project) => validUserIds.has(project.ownerId)).map((project) => project.id))
+    db.cloud_projects = (db.cloud_projects || []).filter((project) => projectIds.has(project.id))
+    db.cloud_api_keys = (db.cloud_api_keys || []).filter((key) => projectIds.has(key.projectId))
+    db.api_keys = Object.fromEntries(Object.entries(db.api_keys || {}).filter(([, userId]) => validUserIds.has(userId)))
+    db.wallets = Object.fromEntries(Object.entries(db.wallets || {}).filter(([projectId]) => projectIds.has(projectId)))
+    db.topups = (db.topups || []).filter((topup) => projectIds.has(topup.projectId))
+    changed = true
+  }
   return changed
 }
 
@@ -1885,5 +1896,11 @@ export async function handler(event) {
   const headers = event.headers || {}
   const body = event.body ? (event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf-8') : event.body) : null
   const queryParams = event.queryStringParameters || {}
-  return await routeHandler(method, path, headers, body, queryParams)
+  try {
+    return await routeHandler(method, path, headers, body, queryParams)
+  } catch {
+    const requestId = makeRequestId()
+    const origin = headers.origin || headers.Origin || ''
+    return withCors(respond(503, fail('storage_unavailable', 'Persistent storage is temporarily unavailable.', requestId)), origin)
+  }
 }
