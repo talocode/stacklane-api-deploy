@@ -400,6 +400,18 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return r(200, ok({ status: 'ok', service: 'stacklane-api', version: '0.6.0', timestamp: new Date().toISOString() }, requestId))
   }
 
+  if (method === 'GET' && path === '/health/storage') {
+    try {
+      await ensurePostgres()
+      const result = await getPool().query(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'stacklane_api_state') AS ready",
+      )
+      return r(200, ok({ status: 'ok', storage: 'postgres', ready: result.rows[0]?.ready === true }, requestId))
+    } catch (err) {
+      return e(503, 'storage_unavailable', 'Postgres storage is not available.')
+    }
+  }
+
   // Telemetry ping (no auth)
   if (method === 'POST' && path === '/v1/telemetry/ping') {
     return r(200, ok({ status: 'ok', ts: new Date().toISOString() }, requestId))
