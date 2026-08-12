@@ -5,7 +5,7 @@
 
 [functions]
   node_bundler = "esbuild"
-  external_node_modules = ["@netlify/blobs"]
+external_node_modules = ["@netlify/blobs", "pg"]
 
 [[redirects]]
   from = "/*"
