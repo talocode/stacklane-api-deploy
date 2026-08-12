@@ -5,7 +5,6 @@ import pg from 'pg'
 const DB_PATH = '/tmp/stacklane-db.json'
 const BLOB_STORE = 'stacklane-cloud'
 const BLOB_KEY = 'main-db'
-const POSTGRES_STATE_ID = 'primary'
 const { Pool } = pg
 
 /** @type {any} */
@@ -33,13 +32,7 @@ async function ensurePostgres() {
     postgresReady = (async () => {
       const client = await getPool().connect()
       try {
-        await client.query(`
-          CREATE TABLE IF NOT EXISTS stacklane_api_state (
-            id TEXT PRIMARY KEY,
-            payload JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-          )
-        `)
+        await client.query('SELECT 1 FROM stacklane.users LIMIT 1')
       } finally {
         client.release()
       }
@@ -112,13 +105,31 @@ async function loadDb() {
   if (dbCache) return dbCache
   await ensurePostgres()
   const database = getPool()
-  const stored = await database.query(
-    'SELECT payload FROM stacklane_api_state WHERE id = $1',
-    [POSTGRES_STATE_ID],
-  )
-  if (stored.rows[0]?.payload && Array.isArray(stored.rows[0].payload.users)) {
-    dbCache = stored.rows[0].payload
-    if (normalizeStoredSecrets(dbCache)) await saveDb(dbCache)
+  const existing = await database.query('SELECT COUNT(*)::int AS count FROM stacklane.users')
+  if (existing.rows[0].count > 0) {
+    const [users, sessions, projects, keys, wallets, transactions, usageEvents, topups] = await Promise.all([
+      database.query('SELECT id, email, name, password_hash, status, last_login_at, created_at, updated_at FROM stacklane.users'),
+      database.query('SELECT token_hash, user_id, created_at FROM stacklane.sessions WHERE expires_at > now()'),
+      database.query('SELECT id, owner_id, name, slug, created_at, updated_at FROM stacklane.cloud_projects'),
+      database.query('SELECT id, project_id, user_id, name, prefix, key_hash, mode, status, last_used_at, created_at, updated_at FROM stacklane.api_keys'),
+      database.query('SELECT id, project_id, balance_credits, lifetime_credits, lifetime_spend, free_credits_granted, created_at, updated_at FROM stacklane.wallets'),
+      database.query('SELECT id, wallet_id, type, credits_delta, balance_after, reference, metadata, created_at FROM stacklane.transactions'),
+      database.query('SELECT id, project_id, user_id, api_key_id, product, action, credits, status, metadata, created_at FROM stacklane.usage_events'),
+      database.query('SELECT id, project_id, credits, amount_usd, status, provider, created_at, updated_at FROM stacklane.topups'),
+    ])
+    dbCache = {
+      users: users.rows.map((row) => ({ id: row.id, email: row.email, name: row.name, passwordHash: row.password_hash, status: row.status, lastLoginAt: row.last_login_at, createdAt: row.created_at, updatedAt: row.updated_at })),
+      sessions: Object.fromEntries(sessions.rows.map((row) => [row.token_hash, { userId: row.user_id, createdAt: row.created_at }])),
+      cloud_projects: projects.rows.map((row) => ({ id: row.id, ownerId: row.owner_id, name: row.name, slug: row.slug, createdAt: row.created_at, updatedAt: row.updated_at })),
+      cloud_api_keys: keys.rows.map((row) => ({ id: row.id, projectId: row.project_id, userId: row.user_id, name: row.name, prefix: row.prefix, keyHash: row.key_hash, mode: row.mode, status: row.status, lastUsedAt: row.last_used_at, createdAt: row.created_at, updatedAt: row.updated_at })),
+      api_keys: Object.fromEntries(keys.rows.filter((row) => row.status === 'active').map((row) => [`sha256:${row.key_hash}`, row.user_id])),
+      wallets: Object.fromEntries(wallets.rows.map((row) => [row.project_id, { id: row.id, projectId: row.project_id, balance: row.balance_credits, lifetimeCredits: row.lifetime_credits, lifetimeSpend: row.lifetime_spend, freeCreditsGranted: row.free_credits_granted, createdAt: row.created_at, updatedAt: row.updated_at }])),
+      transactions: transactions.rows.map((row) => ({ id: row.id, walletId: row.wallet_id, type: row.type, creditsDelta: row.credits_delta, balanceAfter: row.balance_after, reference: row.reference, metadata: row.metadata, createdAt: row.created_at })),
+      usage_events: usageEvents.rows.map((row) => ({ id: row.id, project_id: row.project_id, user_id: row.user_id, api_key_id: row.api_key_id, product: row.product, action: row.action, credits: row.credits, status: row.status, metadata: row.metadata, created_at: row.created_at })),
+      topups: topups.rows.map((row) => ({ id: row.id, projectId: row.project_id, credits: row.credits, amountUsd: Number(row.amount_usd), status: row.status, provider: row.provider, createdAt: row.created_at, updatedAt: row.updated_at })),
+      profiles: Object.fromEntries(wallets.rows.map((row) => [row.project_id, { purchased_credits_balance: row.balance_credits, free_plan_credits_used: 0 }])),
+      project_api_keys: [], regions: [], organizations: [], projects: [], environments: [], provisioning_tasks: [], provisioning_attempts: [], audit_events: [],
+    }
     return dbCache
   }
 
@@ -140,6 +151,8 @@ async function loadDb() {
   }
   try {
     dbCache = JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
+    normalizeStoredSecrets(dbCache)
+    await saveDb(dbCache)
     return dbCache
   } catch {
     dbCache = seedDb()
@@ -151,12 +164,31 @@ async function loadDb() {
 async function saveDb(db) {
   dbCache = db
   await ensurePostgres()
-  await getPool().query(
-    `INSERT INTO stacklane_api_state (id, payload, updated_at)
-     VALUES ($1, $2::jsonb, now())
-     ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
-    [POSTGRES_STATE_ID, JSON.stringify(db)],
-  )
+  const client = await getPool().connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('DELETE FROM stacklane.sessions')
+    await client.query('DELETE FROM stacklane.usage_events')
+    await client.query('DELETE FROM stacklane.transactions')
+    await client.query('DELETE FROM stacklane.topups')
+    await client.query('DELETE FROM stacklane.api_keys')
+    await client.query('DELETE FROM stacklane.wallets')
+    await client.query('DELETE FROM stacklane.cloud_projects')
+    for (const user of db.users || []) {
+      await client.query('INSERT INTO stacklane.users (id, email, name, password_hash, status, last_login_at, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET email=EXCLUDED.email,name=EXCLUDED.name,password_hash=EXCLUDED.password_hash,status=EXCLUDED.status,last_login_at=EXCLUDED.last_login_at,updated_at=EXCLUDED.updated_at', [user.id, user.email, user.name, user.passwordHash, user.status || 'active', user.lastLoginAt, user.createdAt, user.updatedAt])
+    }
+    for (const project of db.cloud_projects || []) await client.query('INSERT INTO stacklane.cloud_projects (id, owner_id, name, slug, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6)', [project.id, project.ownerId, project.name, project.slug, project.createdAt, project.updatedAt])
+    for (const wallet of Object.values(db.wallets || {})) await client.query('INSERT INTO stacklane.wallets (id, project_id, balance_credits, lifetime_credits, lifetime_spend, free_credits_granted, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [wallet.id, wallet.projectId, wallet.balance || wallet.balanceCredits || 0, wallet.lifetimeCredits || 0, wallet.lifetimeSpend || 0, !!wallet.freeCreditsGranted, wallet.createdAt, wallet.updatedAt])
+    for (const key of db.cloud_api_keys || []) await client.query('INSERT INTO stacklane.api_keys (id, project_id, user_id, name, prefix, key_hash, mode, status, last_used_at, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [key.id, key.projectId, key.userId || db.api_keys[`sha256:${key.keyHash}`], key.name, key.prefix, key.keyHash, key.mode, key.status, key.lastUsedAt, key.createdAt, key.updatedAt])
+    for (const [tokenHash, session] of Object.entries(db.sessions || {})) await client.query('INSERT INTO stacklane.sessions (token_hash, user_id, expires_at, created_at) VALUES ($1,$2,now() + interval \'7 days\',$3)', [tokenHash, session.userId, session.createdAt])
+    for (const tx of db.transactions || []) await client.query('INSERT INTO stacklane.transactions (id, wallet_id, type, credits_delta, balance_after, reference, metadata, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [tx.id, tx.walletId, tx.type, tx.creditsDelta, tx.balanceAfter, tx.reference, tx.metadata || {}, tx.createdAt])
+    for (const event of db.usage_events || []) await client.query('INSERT INTO stacklane.usage_events (id, project_id, user_id, api_key_id, product, action, credits, status, metadata, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [event.id || makeId('ue'), event.project_id, event.user_id, event.api_key_id, event.product, event.action, event.credits, event.status || 'charged', event.metadata || {}, event.created_at])
+    for (const topup of db.topups || []) await client.query('INSERT INTO stacklane.topups (id, project_id, credits, amount_usd, status, provider, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [topup.id, topup.projectId, topup.credits, topup.amountUsd, topup.status, topup.provider, topup.createdAt, topup.updatedAt || topup.createdAt])
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally { client.release() }
 }
 
 function makeToken() {
@@ -403,10 +435,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (method === 'GET' && path === '/health/storage') {
     try {
       await ensurePostgres()
-      const result = await getPool().query(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'stacklane_api_state') AS ready",
-      )
-      return r(200, ok({ status: 'ok', storage: 'postgres', ready: result.rows[0]?.ready === true }, requestId))
+      const result = await getPool().query('SELECT COUNT(*)::int AS users FROM stacklane.users')
+      return r(200, ok({ status: 'ok', storage: 'postgres', ready: true, userCount: result.rows[0]?.users || 0 }, requestId))
     } catch (err) {
       return e(503, 'storage_unavailable', 'Postgres storage is not available.')
     }
