@@ -1546,6 +1546,39 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
 
+  // ── AudioLane (live transcription) ───────────────────────────────
+  if (path.startsWith('/v1/audiolane/')) {
+    const sub = path.replace('/v1/audiolane', '')
+    const { AUDIOLANE_VERSION, pricing, capabilities, validateInput, transcribe } = await import('./audiolane-engine.mjs')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) return r(200, { ok: true, service: 'audiolane', version: AUDIOLANE_VERSION, workerConfigured: Boolean(process.env.AUDIOLANE_TRANSCRIBE_URL), meta: { requestId } })
+    if (method === 'GET' && sub === '/pricing') return r(200, { ...pricing, meta: { requestId } })
+    if (method === 'GET' && sub === '/capabilities') return r(200, { ...capabilities(), meta: { requestId } })
+    if (method === 'POST' && sub === '/transcriptions') {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body)
+      try { validateInput(payload) } catch (err) { return e(422, 'validation_error', err.message) }
+      const timestamps = payload.timestamps === 'segments' || payload.timestamps === 'words' ? payload.timestamps : 'none'
+      const credits = timestamps === 'none' ? pricing.transcription : pricing['transcription.timestamps']
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = await transcribe(payload)
+        profile.purchased_credits_balance = balance - credits
+        const action = timestamps === 'none' ? 'audiolane.transcription' : 'audiolane.transcription.timestamps'
+        db.usage_events.push({ user_id: userId, product: 'audiolane', action, credits, metadata: { mimeType: payload.mimeType, timestamps, source: payload.audioUrl ? 'url' : 'base64' }, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, { ...result, usage: { credits, action, remaining: profile.purchased_credits_balance }, meta: { requestId } })
+      } catch (err) {
+        return e(err.code === 'provider_unavailable' ? 503 : 502, err.code || 'transcription_error', err.message || 'Transcription failed')
+      }
+    }
+    return e(404, 'not_found', `AudioLane route not found: ${method} ${path}`)
+  }
+
   // ── CalcLane (live engine) ───────────────────────────────────────
   if (path.startsWith('/v1/calclane/')) {
     const sub = path.replace('/v1/calclane', '')
