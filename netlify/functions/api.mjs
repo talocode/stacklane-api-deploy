@@ -1546,6 +1546,21 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
 
+  // ── Product registry (namespaces awaiting connected backends) ────
+  const registryEntry = (await import('./product-registry.mjs')).getProductNamespace(path)
+  if (registryEntry) {
+    const { namespace, subpath, product } = registryEntry
+    const { productCapabilities } = await import('./product-registry.mjs')
+    if (method === 'GET' && (subpath === '/health' || subpath === '/' || subpath === '')) {
+      return r(200, ok({ status: 'ok', service: namespace, version: '0.1.0', ...productCapabilities(namespace, product) }, requestId))
+    }
+    if (method === 'GET' && subpath === '/capabilities') return r(200, ok(productCapabilities(namespace, product), requestId))
+    if (method === 'GET' && subpath === '/pricing') return r(200, ok({ product: product.name, status: 'not_configured', operations: product.operations.map((operation) => ({ operation, credits: null })) }, requestId))
+    const auth = await requireApiKey(headers)
+    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    return r(501, fail('not_deployed', `${product.name} execution is not connected in the edge deployment. Discovery endpoints are available at /v1/${namespace}/health, /pricing, and /capabilities.`, requestId))
+  }
+
   // ── AudioLane (live transcription) ───────────────────────────────
   if (path.startsWith('/v1/audiolane/')) {
     const sub = path.replace('/v1/audiolane', '')
