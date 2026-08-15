@@ -1546,6 +1546,19 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
 
+  // ── Canonical hosted capability registry ─────────────────────────
+  if (method === 'GET' && path === '/v1/capabilities') {
+    const { capabilityRegistry } = await import('./capabilities-registry.mjs')
+    return r(200, { ok: true, ...capabilityRegistry(), meta: { requestId } })
+  }
+  if (method === 'GET' && path.startsWith('/v1/capabilities/')) {
+    const productId = path.slice('/v1/capabilities/'.length)
+    const { capabilityByProduct } = await import('./capabilities-registry.mjs')
+    const product = capabilityByProduct(productId)
+    if (!product) return e(404, 'not_found', `Unknown product capability: ${productId}`)
+    return r(200, { ok: true, product, meta: { requestId } })
+  }
+
   // ── Product registry (namespaces awaiting connected backends) ────
   const registryEntry = (await import('./product-registry.mjs')).getProductNamespace(path)
   if (registryEntry) {
