@@ -1919,16 +1919,559 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
 
-  // ── VerifyLane / TraceLane / HandoffLane / StyleLane / SpendCaps (thin edge) ──
+  // ── VerifyLane (live deterministic engine) ─────────────────────────
   if (path.startsWith('/v1/verifylane/')) {
     const sub = path.replace('/v1/verifylane', '')
-    if (method === 'GET' && (sub === '/health' || sub === '/pricing' || sub === '/capabilities')) {
-      return r(200, ok({ status: 'ok', service: 'verifylane', version: '0.1.0', note: 'Full engine on Stacklane monorepo deploy; edge stub health/pricing' }, requestId))
+    const {
+      verifySecrets, verifySecurity, verifyQuality, verifyCode, verifyDiff, verifyAgentOutput,
+      verifyEmail, verifyPhone, verifyIp, verifyData,
+      getVerifyLanePricing, getVerifyLaneCapabilities, VERIFYLANE_VERSION,
+    } = await import('./verifylane-engine.mjs')
+
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ ok: true, service: 'verifylane', version: VERIFYLANE_VERSION, endpoints: getVerifyLaneCapabilities().endpoints }, requestId))
     }
-    if (method === 'POST') {
-      return r(501, fail('not_deployed', 'VerifyLane engine requires Stacklane monorepo function bundle with services/verifylane. Use npm @talocode/verifylane local engine until redeploy.', requestId))
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getVerifyLanePricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getVerifyLaneCapabilities(), requestId))
+
+    const runVerify = async (action, credits, runner) => {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = runner()
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'verifylane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'verify failed')
+      }
     }
+
+    if (method === 'POST' && sub === '/secrets') return runVerify('verifylane.secrets', 3, () => verifySecrets(jsonBody(body)))
+    if (method === 'POST' && sub === '/security') return runVerify('verifylane.security', 5, () => verifySecurity(jsonBody(body)))
+    if (method === 'POST' && sub === '/quality') return runVerify('verifylane.quality', 3, () => verifyQuality(jsonBody(body)))
+    if (method === 'POST' && sub === '/code') return runVerify('verifylane.code', 8, () => verifyCode(jsonBody(body)))
+    if (method === 'POST' && sub === '/diff') return runVerify('verifylane.diff', 8, () => verifyDiff(jsonBody(body)))
+    if (method === 'POST' && sub === '/agent-output') return runVerify('verifylane.agent-output', 5, () => verifyAgentOutput(jsonBody(body)))
+    if (method === 'POST' && sub === '/email') {
+      const payload = jsonBody(body) || {}
+      const value = typeof payload.value === 'string' ? payload.value : ''
+      if (!value) return e(422, 'validation_error', 'value is required.')
+      return runVerify('verifylane.email', 1, () => verifyEmail(value))
+    }
+    if (method === 'POST' && sub === '/phone') {
+      const payload = jsonBody(body) || {}
+      const value = typeof payload.value === 'string' ? payload.value : ''
+      if (!value) return e(422, 'validation_error', 'value is required.')
+      return runVerify('verifylane.phone', 1, () => verifyPhone(value, { country: typeof payload.country === 'string' ? payload.country : undefined }))
+    }
+    if (method === 'POST' && sub === '/ip') {
+      const payload = jsonBody(body) || {}
+      const value = typeof payload.value === 'string' ? payload.value : ''
+      if (!value) return e(422, 'validation_error', 'value is required.')
+      return runVerify('verifylane.ip', 1, () => verifyIp(value))
+    }
+    if (method === 'POST' && sub === '/data') {
+      const payload = jsonBody(body) || {}
+      if (!Array.isArray(payload.values)) return e(422, 'validation_error', 'values array is required.')
+      return runVerify('verifylane.data', 2, () => verifyData({ values: payload.values }))
+    }
+    return e(404, 'not_found', `VerifyLane route not found: ${method} ${path}`)
   }
+
+  // ── SpendCaps (live deterministic engine) ─────────────────────────
+  if (path.startsWith('/v1/spendcaps/')) {
+    const sub = path.replace('/v1/spendcaps', '')
+    const { checkSpendCap, getSpendCapsPricing, getSpendCapsCapabilities, SPENDCAPS_VERSION } = await import('./spendcaps-engine.mjs')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'spendcaps', version: SPENDCAPS_VERSION, endpoints: getSpendCapsCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getSpendCapsPricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getSpendCapsCapabilities(), requestId))
+    if (method === 'POST' && sub === '/check') {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const payload = jsonBody(body) || {}
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        const result = checkSpendCap({ ...payload, balanceCredits: payload.balanceCredits ?? balance })
+        if (result.allowed) {
+          db.usage_events.push({ user_id: userId, product: 'spendcaps', action: 'spendcaps.check', credits: 1, metadata: { action: payload.action || '' }, created_at: new Date().toISOString(), request_id: requestId })
+          await saveDb(db)
+        }
+        return r(200, ok({ ...result, usage: { credits: 1, action: 'spendcaps.check', remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'check failed')
+      }
+    }
+    return e(404, 'not_found', `SpendCaps route not found: ${method} ${path}`)
+  }
+
+  // ── PolicyLane (live deterministic engine) ────────────────────────
+  if (path.startsWith('/v1/policylane/')) {
+    const sub = path.replace('/v1/policylane', '')
+    const { checkPolicy, redact, getPolicyLanePricing, getPolicyLaneCapabilities, POLICYLANE_VERSION } = await import('./policylane-engine.mjs')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ ok: true, service: 'policylane', version: POLICYLANE_VERSION, endpoints: getPolicyLaneCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getPolicyLanePricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getPolicyLaneCapabilities(), requestId))
+    if (method === 'POST' && sub === '/check') {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body)
+      if (!payload || !payload.policy || !payload.action) return e(422, 'validation_error', 'action and policy are required.')
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        const credits = 2
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = checkPolicy(payload)
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'policylane', action: 'policylane.check', credits, metadata: { action: payload.action }, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action: 'policylane.check', remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'check failed')
+      }
+    }
+    if (method === 'POST' && sub === '/redact') {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body) || {}
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        const credits = 1
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = redact(payload.value ?? payload.payload, payload.patterns)
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'policylane', action: 'policylane.redact', credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ product: 'policylane', version: POLICYLANE_VERSION, ...result, usage: { credits, action: 'policylane.redact', remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'redact failed')
+      }
+    }
+    return e(404, 'not_found', `PolicyLane route not found: ${method} ${path}`)
+  }
+
+  // ── ReliabilityLane (live deterministic engine) ───────────────────
+  if (path.startsWith('/v1/reliabilitylane/')) {
+    const sub = path.replace('/v1/reliabilitylane', '')
+    const {
+      FAILURE_PATTERNS, RETRY_STRATEGIES, VERIFICATION_CHECKLISTS, INCIDENT_PLAYBOOKS, ANTI_PATTERNS,
+      matchFailure, planRetry, verify, incidentFor,
+      getReliabilityLanePricing, getReliabilityLaneCapabilities, RELIABILITYLANE_VERSION,
+    } = await import('./reliabilitylane-engine.mjs')
+
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ ok: true, service: 'reliabilitylane', version: RELIABILITYLANE_VERSION, endpoints: getReliabilityLaneCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getReliabilityLanePricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getReliabilityLaneCapabilities(), requestId))
+    if (method === 'GET' && sub === '/antipatterns') return r(200, ok({ product: 'reliabilitylane', version: RELIABILITYLANE_VERSION, antiPatterns: ANTI_PATTERNS }, requestId))
+    if (method === 'GET' && sub === '/patterns') return r(200, ok({ product: 'reliabilitylane', version: RELIABILITYLANE_VERSION, patterns: FAILURE_PATTERNS }, requestId))
+    if (method === 'GET' && sub === '/retries') return r(200, ok({ product: 'reliabilitylane', version: RELIABILITYLANE_VERSION, strategies: RETRY_STRATEGIES }, requestId))
+    if (method === 'GET' && sub === '/checklists') return r(200, ok({ product: 'reliabilitylane', version: RELIABILITYLANE_VERSION, checklists: VERIFICATION_CHECKLISTS }, requestId))
+    if (method === 'GET' && sub === '/playbooks') return r(200, ok({ product: 'reliabilitylane', version: RELIABILITYLANE_VERSION, playbooks: INCIDENT_PLAYBOOKS }, requestId))
+    const patternMatch = sub.match(/^\/patterns\/([\w-]+)$/)
+    if (method === 'GET' && patternMatch) {
+      const pattern = FAILURE_PATTERNS.find((p) => p.id === patternMatch[1])
+      if (!pattern) return e(404, 'not_found', `ReliabilityLane pattern '${patternMatch[1]}' not found.`)
+      return r(200, ok({ product: 'reliabilitylane', version: RELIABILITYLANE_VERSION, pattern }, requestId))
+    }
+
+    const runReliability = async (action, credits, runner) => {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = runner()
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'reliabilitylane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'reliabilitylane call failed')
+      }
+    }
+
+    if (method === 'POST' && sub === '/match') {
+      const payload = jsonBody(body) || {}
+      return runReliability('reliabilitylane.patterns', 1, () => matchFailure({
+        symptom: typeof payload.symptom === 'string' ? payload.symptom : '',
+        error: typeof payload.error === 'string' ? payload.error : '',
+        category: typeof payload.category === 'string' ? payload.category : undefined,
+      }))
+    }
+    if (method === 'POST' && sub === '/retry-plan') {
+      const payload = jsonBody(body) || {}
+      return runReliability('reliabilitylane.retry', 1, () => planRetry({
+        status: typeof payload.status === 'number' ? payload.status : undefined,
+        code: typeof payload.code === 'string' ? payload.code : undefined,
+        message: typeof payload.message === 'string' ? payload.message : undefined,
+        kind: typeof payload.kind === 'string' ? payload.kind : undefined,
+      }))
+    }
+    if (method === 'POST' && sub === '/verify') {
+      const payload = jsonBody(body) || {}
+      return runReliability('reliabilitylane.verify', 1, () => verify({
+        checklist: typeof payload.checklist === 'string' ? payload.checklist : undefined,
+        area: typeof payload.area === 'string' ? payload.area : undefined,
+        evidence: payload.evidence && typeof payload.evidence === 'object' ? payload.evidence : undefined,
+      }))
+    }
+    if (method === 'POST' && sub === '/incident') {
+      const payload = jsonBody(body) || {}
+      return runReliability('reliabilitylane.incident', 2, () => incidentFor({
+        symptom: typeof payload.symptom === 'string' ? payload.symptom : '',
+        error: typeof payload.error === 'string' ? payload.error : '',
+      }))
+    }
+    return e(404, 'not_found', `ReliabilityLane route not found: ${method} ${path}`)
+  }
+
+  // ── DocuLane (live engine) ────────────────────────────────────────
+  if (path.startsWith('/v1/doculane/')) {
+    const sub = path.replace('/v1/doculane', '')
+    const { readFile, writeFile, getFileInfo, extractFromDocument, getDocuLanePricing, getDocuLaneCapabilities, DOCULANE_VERSION } = await import('./doculane-engine.mjs')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ ok: true, service: 'doculane', version: DOCULANE_VERSION, endpoints: getDocuLaneCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getDocuLanePricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getDocuLaneCapabilities(), requestId))
+
+    const runDoculane = async (action, credits, runner) => {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = await runner()
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'doculane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'doculane call failed')
+      }
+    }
+
+    if (method === 'POST' && sub === '/read') {
+      const payload = jsonBody(body) || {}
+      if (!payload.fileUrl || !payload.fileType) return e(422, 'validation_error', 'fileUrl and fileType are required.')
+      return runDoculane('doculane.read', 5, () => readFile({ fileUrl: payload.fileUrl, fileType: payload.fileType }))
+    }
+    if (method === 'POST' && sub === '/write') {
+      const payload = jsonBody(body) || {}
+      if (!payload.fileType || !payload.content) return e(422, 'validation_error', 'fileType and content are required.')
+      return runDoculane('doculane.write', 5, () => writeFile({ fileType: payload.fileType, content: payload.content }))
+    }
+    if (method === 'POST' && sub === '/info') {
+      const payload = jsonBody(body) || {}
+      if (!payload.fileUrl || !payload.fileType) return e(422, 'validation_error', 'fileUrl and fileType are required.')
+      return runDoculane('doculane.info', 2, () => getFileInfo({ fileUrl: payload.fileUrl, fileType: payload.fileType }))
+    }
+    if (method === 'POST' && sub === '/extract') {
+      const payload = jsonBody(body) || {}
+      if (!payload.documentUrl || !payload.prompt) return e(422, 'validation_error', 'documentUrl and prompt are required.')
+      return runDoculane('doculane.extract', 30, () => extractFromDocument({
+        documentUrl: payload.documentUrl,
+        prompt: payload.prompt,
+        format: typeof payload.format === 'string' ? payload.format : 'json',
+        schema: payload.schema && typeof payload.schema === 'object' ? payload.schema : undefined,
+      }))
+    }
+    return e(404, 'not_found', `DocuLane route not found: ${method} ${path}`)
+  }
+
+  // ── ClipLoop (live engine) ────────────────────────────────────────
+  if (path.startsWith('/v1/cliploop/')) {
+    const {
+      generateBrief, generateScript, submitRender, getRenderStatus, createCampaign, packageCampaign,
+      getClipLoopPricing, getClipLoopCapabilities, CLIPLOOP_VERSION,
+    } = await import('./cliploop-engine.mjs')
+
+    if (method === 'GET' && (path === '/v1/cliploop/health' || path === '/v1/cliploop/')) {
+      return r(200, ok({ status: 'ok', service: 'cliploop', version: CLIPLOOP_VERSION, endpoints: getClipLoopCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && path === '/v1/cliploop/pricing') return r(200, ok(getClipLoopPricing(), requestId))
+    if (method === 'GET' && path === '/v1/cliploop/capabilities') return r(200, ok(getClipLoopCapabilities(), requestId))
+
+    const runClipLoop = async (action, credits, runner) => {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = await runner()
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'cliploop', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        if (err.message && (err.message.includes('No AI provider configured') || err.message.includes('ClipLoop provider'))) {
+          return e(503, 'provider_unavailable', err.message)
+        }
+        return e(422, 'validation_error', err.message || 'cliploop call failed')
+      }
+    }
+
+    if (method === 'POST' && path === '/v1/cliploop/brief/generate') {
+      const payload = jsonBody(body) || {}
+      if (typeof payload.prompt !== 'string' || !payload.prompt.trim()) return e(422, 'validation_error', 'prompt is required.')
+      return runClipLoop('cliploop.brief.generate', 15, () => generateBrief({
+        prompt: payload.prompt,
+        channel: typeof payload.channel === 'string' ? payload.channel : undefined,
+        duration: typeof payload.duration === 'number' ? payload.duration : undefined,
+      }))
+    }
+    if (method === 'POST' && path === '/v1/cliploop/script/generate') {
+      const payload = jsonBody(body) || {}
+      if (typeof payload.briefId !== 'string' || !payload.briefId.trim()) return e(422, 'validation_error', 'briefId is required.')
+      return runClipLoop('cliploop.script.generate', 15, () => generateScript({
+        briefId: payload.briefId,
+        style: typeof payload.style === 'string' ? payload.style : undefined,
+      }))
+    }
+    if (method === 'POST' && path === '/v1/cliploop/video/render') {
+      const payload = jsonBody(body) || {}
+      if (typeof payload.scriptId !== 'string' || !payload.scriptId.trim()) return e(422, 'validation_error', 'scriptId is required.')
+      return runClipLoop('cliploop.video.render', 200, () => submitRender({
+        scriptId: payload.scriptId,
+        format: payload.format === 'landscape' || payload.format === 'square' ? payload.format : undefined,
+        quality: payload.quality === 'draft' || payload.quality === 'standard' || payload.quality === 'high' ? payload.quality : undefined,
+      }))
+    }
+    if (method === 'POST' && path === '/v1/cliploop/campaign/create') {
+      const payload = jsonBody(body) || {}
+      if (typeof payload.name !== 'string' || !payload.name.trim()) return e(422, 'validation_error', 'name is required.')
+      if (typeof payload.platform !== 'string' || !payload.platform.trim()) return e(422, 'validation_error', 'platform is required.')
+      return runClipLoop('cliploop.campaign.create', 50, () => createCampaign({
+        name: payload.name,
+        platform: payload.platform,
+        schedule: typeof payload.schedule === 'string' ? payload.schedule : undefined,
+      }))
+    }
+    if (method === 'POST' && path === '/v1/cliploop/campaign/package') {
+      const payload = jsonBody(body) || {}
+      if (typeof payload.campaignId !== 'string' || !payload.campaignId.trim()) return e(422, 'validation_error', 'campaignId is required.')
+      return runClipLoop('cliploop.campaign.package', 400, () => packageCampaign(payload.campaignId))
+    }
+    if (method === 'GET' && path.startsWith('/v1/cliploop/video/')) {
+      const renderId = decodeURIComponent(path.replace('/v1/cliploop/video/', ''))
+      try {
+        const result = await getRenderStatus(renderId)
+        return r(200, ok(result, requestId))
+      } catch (err) {
+        return e(404, 'not_found', err.message || 'Render job not found.')
+      }
+    }
+    return e(404, 'not_found', `ClipLoop route not found: ${method} ${path}`)
+  }
+
+  // ── Wiki (live engine, blob-backed) ───────────────────────────────
+  if (path.startsWith('/v1/wiki/')) {
+    const sub = path.replace('/v1/wiki', '')
+    const { wikiInit, wikiIngest, wikiQuery, wikiLint, wikiSave, getWikiPricing, getWikiCapabilities, WIKI_VERSION } = await import('./wiki-engine.mjs')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, ok({ status: 'ok', service: 'wiki', version: WIKI_VERSION, endpoints: ['/v1/wiki/init', '/v1/wiki/ingest', '/v1/wiki/query', '/v1/wiki/lint', '/v1/wiki/save'] }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getWikiPricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getWikiCapabilities(), requestId))
+
+    const runWiki = async (action, credits, runner) => {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = await runner(db)
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'wiki', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'wiki call failed')
+      }
+    }
+
+    if (method === 'POST' && sub === '/init') return runWiki('wiki.init', 0, (db) => wikiInit(db))
+    if (method === 'POST' && sub === '/ingest') {
+      const payload = jsonBody(body) || {}
+      if (!payload.source && !payload.content) return e(422, 'validation_error', 'source or content required.')
+      return runWiki('wiki.ingest', 5, (db) => wikiIngest(db, payload))
+    }
+    if (method === 'POST' && sub === '/query') {
+      const payload = jsonBody(body) || {}
+      if (!payload.question) return e(422, 'validation_error', 'question required.')
+      return runWiki('wiki.query', 3, (db) => wikiQuery(db, payload.question))
+    }
+    if (method === 'POST' && sub === '/lint') return runWiki('wiki.lint', 2, (db) => wikiLint(db))
+    if (method === 'POST' && sub === '/save') {
+      const payload = jsonBody(body) || {}
+      if (!payload.title || !payload.content) return e(422, 'validation_error', 'title and content required.')
+      return runWiki('wiki.save', 2, (db) => wikiSave(db, payload))
+    }
+    return e(404, 'not_found', `Wiki route not found: ${method} ${path}`)
+  }
+
+  // ── VideoLane (proxy to configured server) ────────────────────────
+  if (path.startsWith('/v1/videolane/')) {
+    const sub = path.replace('/v1/videolane', '')
+    const { generateVideoPlan, generateCaptions, generateMetadata, checkHealth, getVideoLanePricing, getVideoLaneCapabilities, VIDEOLANE_VERSION } = await import('./videolane-engine.mjs')
+    const workerConfigured = Boolean(process.env.VIDEOLANE_SERVER_URL)
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      const health = workerConfigured ? await checkHealth() : { ok: false, error: 'not configured' }
+      return r(200, ok({ ok: health.ok, service: 'videolane', version: VIDEOLANE_VERSION, workerConfigured, server: health }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getVideoLanePricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getVideoLaneCapabilities(), requestId))
+
+    const runVideoLane = async (action, credits, runner) => {
+      if (!workerConfigured) return e(503, 'provider_unavailable', 'No VideoLane server is configured (VIDEOLANE_SERVER_URL).')
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      try {
+        const db = await loadDb()
+        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+        const balance = profile.purchased_credits_balance || 0
+        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const result = await runner()
+        profile.purchased_credits_balance = balance - credits
+        db.usage_events.push({ user_id: userId, product: 'videolane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+        await saveDb(db)
+        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+      } catch (err) {
+        return e(422, 'validation_error', err.message || 'videolane call failed')
+      }
+    }
+
+    if (method === 'POST' && sub === '/plan') {
+      const payload = jsonBody(body) || {}
+      const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : ''
+      if (!prompt) return e(422, 'validation_error', 'prompt is required.')
+      return runVideoLane('videolane.plan', 30, () => generateVideoPlan({
+        prompt,
+        style: payload.style,
+        duration: payload.duration,
+      }).then((result) => {
+        if (!result.ok) throw new Error(result.error || 'Video plan generation failed.')
+        return { ok: true, plan: result.plan }
+      }))
+    }
+    if (method === 'POST' && sub === '/captions') {
+      const payload = jsonBody(body) || {}
+      const planPath = typeof payload.plan === 'string' ? payload.plan.trim() : ''
+      if (!planPath) return e(422, 'validation_error', 'plan path is required.')
+      return runVideoLane('videolane.captions', 10, () => generateCaptions(planPath))
+    }
+    if (method === 'POST' && sub === '/metadata') {
+      const payload = jsonBody(body) || {}
+      const title = typeof payload.title === 'string' ? payload.title.trim() : ''
+      if (!title) return e(422, 'validation_error', 'title is required.')
+      return runVideoLane('videolane.metadata', 10, () => generateMetadata(title, typeof payload.outDir === 'string' ? payload.outDir : undefined))
+    }
+    return e(404, 'not_found', `VideoLane route not found: ${method} ${path}`)
+  }
+
+  // ── Gateway (LLM gateway proxy) ───────────────────────────────────
+  if (path.startsWith('/v1/gateway/')) {
+    const sub = path.replace('/v1/gateway', '')
+    const {
+      loadGatewayConfig, getGatewayUsage, getLLMGatewayPricing, getLLMGatewayCapabilities,
+      proxyChatCompletion, LLMGATEWAY_VERSION,
+    } = await import('./gateway-engine.mjs')
+
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      const config = loadGatewayConfig()
+      return r(200, ok({ ok: true, service: 'llmgateway', version: LLMGATEWAY_VERSION, providerConfigured: Boolean(config), endpoints: getLLMGatewayCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, ok(getLLMGatewayPricing(), requestId))
+    if (method === 'GET' && sub === '/capabilities') return r(200, ok(getLLMGatewayCapabilities(), requestId))
+
+    const charge = async (action, credits) => {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return { ok: false, response: e(auth.status, auth.code, auth.message) }
+      const db = await loadDb()
+      const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
+      const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
+      const balance = profile.purchased_credits_balance || 0
+      if (balance < credits) return { ok: false, response: r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } }) }
+      profile.purchased_credits_balance = balance - credits
+      db.usage_events.push({ user_id: userId, product: 'llmgateway', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
+      await saveDb(db)
+      return { ok: true, userId, remaining: profile.purchased_credits_balance }
+    }
+
+    if (method === 'GET' && sub === '/models') {
+      const charged = await charge('llmgateway.models', 1)
+      if (!charged.ok) return charged.response
+      const config = loadGatewayConfig()
+      const models = config ? Array.from(new Set(config.providers.flatMap((p) => p.models))) : []
+      return r(200, ok({ object: 'list', data: models.map((id) => ({ id, object: 'model', owned_by: 'llmgateway' })), usage: { credits: 1, action: 'llmgateway.models', remaining: charged.remaining } }, requestId))
+    }
+    if (method === 'GET' && sub === '/usage') {
+      const charged = await charge('llmgateway.usage', 1)
+      if (!charged.ok) return charged.response
+      const result = getGatewayUsage(charged.userId)
+      return r(200, ok({ object: 'usage', ...result, usage: { credits: 1, action: 'llmgateway.usage', remaining: charged.remaining } }, requestId))
+    }
+    if (method === 'POST' && sub === '/chat/completions') {
+      const config = loadGatewayConfig()
+      if (!config) return e(503, 'gateway_not_configured', 'No upstream LLM provider is configured (LLMGATEWAY_PROVIDERS).')
+      const charged = await charge('llmgateway.chat', 10)
+      if (!charged.ok) return charged.response
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+      try {
+        const result = await proxyChatCompletion({
+          config,
+          body: payload,
+          projectId: charged.userId,
+          apiKeyId: charged.userId,
+        })
+        let responsePayload = result.body
+        try {
+          responsePayload = JSON.parse(result.body)
+        } catch { /* keep raw text */ }
+        return r(result.status, ok(responsePayload, requestId))
+      } catch (err) {
+        return e(err instanceof Error && err.message.includes('model is required') ? 422 : 502, 'gateway_error', err.message || 'Upstream provider failed.')
+      }
+    }
+    return e(404, 'not_found', `Gateway route not found: ${method} ${path}`)
+  }
+
+  // ── TraceLane / HandoffLane / StyleLane (thin edge) ──────────────
   if (path.startsWith('/v1/tracelane/')) {
     if (method === 'GET' && path.includes('/health')) return r(200, ok({ status: 'ok', service: 'tracelane', version: '0.1.0' }, requestId))
     return r(501, fail('not_deployed', 'TraceLane full engine pending monorepo function deploy. npm @talocode/tracelane works locally.', requestId))
@@ -1941,9 +2484,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (method === 'GET' && path.includes('/health')) return r(200, ok({ status: 'ok', service: 'stylelane', version: '0.1.0' }, requestId))
     return r(501, fail('not_deployed', 'StyleLane full engine pending monorepo function deploy. npm @talocode/stylelane works locally.', requestId))
   }
-  if (path.startsWith('/v1/spendcaps/')) {
-    if (method === 'GET') return r(200, ok({ status: 'ok', service: 'spendcaps', version: '0.1.0', note: 'Full caps on monorepo deploy' }, requestId))
-  }
+
 
 
   // ── DataLane (live deterministic engine) ──────────────────────────
