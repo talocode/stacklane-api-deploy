@@ -1946,6 +1946,54 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
 
+  // ── DataLane (live deterministic engine) ──────────────────────────
+  if (path.startsWith('/v1/datalane/')) {
+    const {
+      DATALANE_VERSION,
+      buildDataLaneChart,
+      buildDataLaneHtml,
+      getDataLanePricing,
+      getDataLaneCapabilities,
+    } = await import('./datalane-engine.mjs')
+
+    if (method === 'GET' && (path === '/v1/datalane/health' || path === '/v1/datalane/')) {
+      return r(200, ok({ status: 'ok', service: 'datalane', version: DATALANE_VERSION, endpoints: getDataLaneCapabilities().endpoints }, requestId))
+    }
+    if (method === 'GET' && path === '/v1/datalane/pricing') {
+      return r(200, ok(getDataLanePricing(), requestId))
+    }
+    if (method === 'GET' && path === '/v1/datalane/capabilities') {
+      return r(200, ok(getDataLaneCapabilities(), requestId))
+    }
+    if (method === 'POST' && (path === '/v1/datalane/analyze' || path === '/v1/datalane/render')) {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+
+      const isRender = path.endsWith('/render')
+      const credits = isRender ? 1 : 5
+
+      let rows = Array.isArray(payload.rows) ? payload.rows : null
+      let intent = typeof payload.intent === 'string' ? payload.intent : ''
+      if (payload.csv && typeof payload.csv === 'string') {
+        const { parseCsvRows } = await import('./datalane-engine.mjs')
+        rows = parseCsvRows(payload.csv)
+      }
+      if (isRender) {
+        if (!payload.spec || typeof payload.spec !== 'object') return e(400, 'invalid_request', 'spec is required')
+        if (!rows) return e(400, 'invalid_request', 'rows array is required')
+        const chart = buildDataLaneChart({ spec: payload.spec, rows })
+        return r(200, ok({ artifact: buildDataLaneHtml(chart), chart, credits, note: 'Editable HTML artifact with embedded spec + data. Edit and re-render.' }, requestId))
+      }
+      if (!intent) return e(400, 'invalid_request', 'intent is required')
+      if (!rows) return e(400, 'invalid_request', 'rows array is required')
+      const chart = buildDataLaneChart({ intent, rows })
+      return r(200, ok({ chart, credits, note: 'Spec + transformed rows returned. POST /v1/datalane/render with the spec to get the editable HTML artifact.' }, requestId))
+    }
+  }
+
+
   return e(404, 'not_found', `Unknown endpoint: ${method} ${path}`)
 }
 
