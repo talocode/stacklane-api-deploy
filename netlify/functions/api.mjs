@@ -1459,6 +1459,29 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
   }
 
+  // ── WorkLane Socials ──────────────────────────────────────────────
+  if (path.startsWith('/v1/worklane/')) {
+    const sub = path.replace('/v1/worklane', '')
+    const { SOCIALS_VERSION, pricing: socialsPricing, capabilities: socialsCaps, platformStatus, validateInput: validateSocials, publish: publishSocials } = await import('./worklane-socials-engine.mjs')
+    if (method === 'GET' && (sub === '/socials/health' || sub === '/socials')) {
+      return r(200, ok({ status: 'ok', service: 'worklane-socials', version: SOCIALS_VERSION, platforms: platformStatus(), pricing: socialsPricing, capabilities: socialsCaps, timestamp: new Date().toISOString() }, requestId))
+    }
+    if (method === 'GET' && sub === '/socials/pricing') {
+      return r(200, ok(socialsPricing, requestId))
+    }
+    if (method === 'POST' && sub === '/socials/publish') {
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const payload = jsonBody(body)
+      if (!payload) return e(400, 'invalid_request', 'Request body is required')
+      const invalid = validateSocials(payload)
+      if (invalid) return e(400, 'invalid_request', invalid)
+      const results = await publishSocials(payload)
+      const allFailed = results.length > 0 && results.every((x) => !x.ok)
+      return r(allFailed ? 502 : 200, ok({ text: payload.text, mode: 'hosted', results }, requestId))
+    }
+  }
+
   // ── Skills ────────────────────────────────────────────────────────
   if (path.startsWith('/v1/skills/')) {
     const sub = path.replace('/v1/skills', '')

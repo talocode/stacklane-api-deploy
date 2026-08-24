@@ -23,7 +23,7 @@ export const PRODUCT_REGISTRY = {
   tradia: { name: 'Tradia', summary: 'Trading-plan and risk workflows', operations: ['plan'] },
   ugclane: { name: 'UGC Lane', summary: 'Content strategy workflows', operations: ['strategy'] },
   webdatalane: { name: 'WebDataLane', summary: 'Web page extraction workflows', operations: ['fetch'] },
-  worklane: { name: 'WorkLane', summary: 'Work management workflows', operations: ['run'] },
+  worklane: { name: 'WorkLane', summary: 'Agent coworker platform with socials publishing', operations: ['run', 'socials.publish', 'socials.health'] },
   xprolane: { name: 'XProLane', summary: 'X account workflow analysis', operations: ['analyze'] },
   xsearchlane: { name: 'XSearchLane', summary: 'X search and research workflows', operations: ['search', 'research'] },
 }
