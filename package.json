@@ -5,10 +5,12 @@
   "type": "module",
   "packageManager": "pnpm@10.18.0",
   "scripts": {
-    "build": "test -f public/index.html"
+    "build": "test -f public/index.html",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "^9.1.1",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "pg-cloudflare": "^1.4.0"
   }
 }
