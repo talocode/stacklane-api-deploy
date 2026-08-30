@@ -286,6 +286,49 @@ const TCODE_AIRDROPS = {
 const TCODE_REDEEM = { rate: 0.00001, maxCreditsPerMonth: 5000 }
 // rate: credits per raw unit (10 credits / 1_000_000 raw = 0.00001).
 
+// ── Unified balance helpers ──────────────────────────────────────────
+// Wallet is the single source of truth for credits.  Deposits (topup,
+// TCODE, free grant) write wallet.balance.  Consumption MUST also
+// deduct from wallet.balance so the two never diverge.  Profiles are
+// derived from wallets at load time and kept in sync after each debit.
+
+function resolveWallet(db, userId) {
+  const project = (db.cloud_projects || []).find((p) => p.ownerId === userId)
+  if (!project) return null
+  return db.wallets[project.id] || null
+}
+
+function debitCredits(db, userId, credits, product, action, requestId) {
+  const wallet = resolveWallet(db, userId)
+  const now = new Date().toISOString()
+  if (wallet) {
+    const balance = wallet.balance || 0
+    if (balance < credits) return { ok: false, balance, required: credits }
+    wallet.balance = balance - credits
+    wallet.updatedAt = now
+    db.transactions.push({
+      id: makeId('ctxn'),
+      walletId: wallet.id,
+      type: 'usage',
+      creditsDelta: -credits,
+      balanceAfter: wallet.balance,
+      product, action,
+      reference: requestId,
+      metadata: {},
+      createdAt: now,
+    })
+    const profile = db.profiles?.[userId]
+    if (profile) profile.purchased_credits_balance = wallet.balance
+    return { ok: true, balance: wallet.balance }
+  }
+  const profile = db.profiles?.[userId]
+  if (!profile) return { ok: false, balance: 0, required: credits }
+  const bal = profile.purchased_credits_balance || 0
+  if (bal < credits) return { ok: false, balance: bal, required: credits }
+  profile.purchased_credits_balance = bal - credits
+  return { ok: true, balance: profile.purchased_credits_balance }
+}
+
 function extractApiKey(headers) {
   const a = headers['authorization'] || headers['Authorization'] || ''
   if (typeof a === 'string' && a.toLowerCase().startsWith('bearer ')) return a.slice(7).trim()
@@ -444,6 +487,152 @@ function handleError(err, requestId, origin) {
   return withCors(respond(503, fail('internal_error', err.message, requestId)), origin)
 }
 
+const MCP_TOOLS = [
+  { name: "tera_writing_rewrite", description: "Rewrite text with a specific style and tone using Tera. Provide text to rewrite and optional style/tone/maxLength parameters." },
+  { name: "tera_writing_draft", description: "Draft content (email, social post, announcement, article, doc) using Tera. Provide type and brief describing what to write." },
+  { name: "tera_coding_explain", description: "Explain code at beginner, intermediate, or advanced level using Tera. Provide language and code snippet." },
+  { name: "tera_coding_review", description: "Review code for issues, bugs, security, and performance using Tera. Provide language and code to review." },
+  { name: "agent_browser_check", description: "Check a website URL for status, content, and optionally capture a screenshot or run vision analysis. Provide URL to check." },
+  { name: "agent_browser_screenshot", description: "Capture a screenshot of a website URL. Optionally set fullPage, viewport width/height. Provide URL to screenshot." },
+  { name: "agent_browser_trace_report", description: "Execute browser trace steps on a URL and report results. Provide URL and array of steps (click, type, navigate)." },
+  { name: "agent_browser_extract", description: "Extract structured content from a URL including title, description, headings, text, links, images, and metadata. Returns clean readable content without browser rendering." },
+  { name: "agent_browser_analyze", description: "Analyze page content from a URL using AI. Returns summary, sentiment, entities, topics, and keywords extracted from the page text." },
+  { name: "cliploop_brief_generate", description: "Generate a video brief for short-form content. Provide a prompt describing the video concept and optional channel/tone/duration." },
+  { name: "cliploop_script_generate", description: "Generate a video script from a brief. Provide the briefId from brief generation." },
+  { name: "cliploop_video_render", description: "Render a video from a script. Provide the scriptId from script generation and optional format/quality." },
+  { name: "cliploop_campaign_create", description: "Create a ClipLoop campaign. Provide name and platform." },
+  { name: "cliploop_campaign_package", description: "Package a ClipLoop campaign for delivery. Provide campaignId." },
+  { name: "cloud_pricing", description: "Get the full Talocode Cloud pricing catalog with all products, actions, and credit costs." },
+  { name: "invoicelane_health", description: "Check InvoiceLane Document API health, version (v0.2), and available endpoints. Free (no credits)." },
+  { name: "invoicelane_pricing", description: "Get InvoiceLane credit pricing: extract 20, receipt.extract 20, invoice.extract 30, validate 10, export.csv 5. Free (no credits)." },
+  { name: "invoicelane_capabilities", description: "List InvoiceLane capabilities, schema contract (invoice requires invoiceNumber/total/currency/date; receipt requires total/currency/date), endpoints, and limitations (text-only, no OCR/PDF in v0.2). Free (no credits)." },
+  { name: "invoicelane_extract", description: "Schema-first extract from invoice/receipt text. Returns merchant/vendor, totals, line items, confidence, missingFields, totalsConsistent, warnings. Provide text (OCR/PDF not supported). 20 credits." },
+  { name: "invoicelane_extract_receipt", description: "Extract a receipt as structured JSON (receiptNumber, vendor, total, date, missingFields, totalsConsistent). Provide raw receipt text. 20 credits." },
+  { name: "invoicelane_extract_invoice", description: "Extract an invoice as structured JSON (invoiceNumber, vendor, subtotal, tax, total, line items, missingFields, totalsConsistent). Schema requires invoiceNumber, total, currency, date. Provide raw invoice text. 30 credits." },
+  { name: "invoicelane_validate", description: "Validate extracted fields against the InvoiceLane schema contract. Checks required fields, numeric totals, and totals consistency (subtotal + tax - discount ≈ total). Returns valid, missingFields, warnings, normalized. 10 credits." },
+  { name: "invoicelane_export_csv", description: "Export an array of extracted invoice/receipt row objects to CSV (escaped headers and values). 5 credits." },
+  { name: "geolane_health", description: "Check GeoLane AI Visibility API health and endpoints. Free (no credits)." },
+  { name: "geolane_pricing", description: "Get GeoLane credit pricing: audit 40, crawlers 15, llms_txt 20, citation_readiness 25, compare 50. Free." },
+  { name: "geolane_capabilities", description: "List GeoLane capabilities: GEO score, AI crawler matrix, citation readiness, llms.txt draft, domain compare. Free." },
+  { name: "geolane_audit", description: "Full AI search visibility (GEO) audit for a URL: composite score/grade, AI crawler access, citation readiness, llms.txt, prioritized action plan. Pay-per-domain intelligence agents use before SEO/content work. 40 credits." },
+  { name: "geolane_crawlers", description: "Check whether major AI crawlers (GPTBot, ClaudeBot, PerplexityBot, Google-Extended, etc.) are allowed in robots.txt. 15 credits." },
+  { name: "geolane_llms_txt", description: "Detect /llms.txt, score quality, and generate a ready-to-publish llms.txt draft for AI agents. 20 credits." },
+  { name: "geolane_citation_readiness", description: "Score a page for AI citation readiness: title, meta, H1, JSON-LD, author/date, FAQ, passage length (~134–167 words), headings. Returns gaps and recommendations. 25 credits." },
+  { name: "geolane_compare", description: "Compare two domains/pages on GEO score, crawler access, citation readiness, and llms.txt. Provide urlA and urlB. 50 credits." },
+  { name: "searchlane_health", description: "Check SearchLane agent search API health and endpoints. Free." },
+  { name: "searchlane_pricing", description: "Get SearchLane credit pricing: query 5, news 8, research 30. Free." },
+  { name: "searchlane_capabilities", description: "List SearchLane capabilities: web query, news search, multi-source research with citations. Free." },
+  { name: "searchlane_query", description: "Agent web search. Returns ranked structured hits (title, url, snippet, score). Uses Brave/Serper if keys set, else DuckDuckGo. 5 credits." },
+  { name: "searchlane_news", description: "News/freshness-biased search for agents. Returns structured news-oriented hits. 8 credits." },
+  { name: "searchlane_research", description: "Deep research: multi-source search + extractive brief with citations. Best for agent research steps. 30 credits." },
+  { name: "calclane_health", description: "Check CalcLane calculator API health and endpoints. Free." },
+  { name: "calclane_pricing", description: "Get CalcLane credit pricing: evaluate 1, dispatch 1. Free." },
+  { name: "calclane_capabilities", description: "List CalcLane modes, features, and HTTP endpoints. Free." },
+  { name: "calclane_evaluate", description: "Evaluate a math expression (standard or scientific). Supports + - * / ^, parentheses, sin/cos/tan, log/ln, sqrt, fact, pi, e. 1 credit." },
+  { name: "calclane_dispatch", description: "Run calculator engine commands (digit, binary, unary, equals, memory-style flows). 1 credit." },
+  { name: "reliabilitylane_health", description: "Check ReliabilityLane reliability API health and endpoints. Free." },
+  { name: "reliabilitylane_pricing", description: "Get ReliabilityLane credit pricing: patterns/retry/verify 1, incident 2. Free." },
+  { name: "reliabilitylane_capabilities", description: "List ReliabilityLane datasets and HTTP endpoints. Free." },
+  { name: "reliabilitylane_patterns", description: "List all curated ReliabilityLane failure patterns (retry hammering, unverified completion, ...). Free." },
+  { name: "reliabilitylane_retries", description: "List all ReliabilityLane retry strategies with backoff plans. Free." },
+  { name: "reliabilitylane_checklists", description: "List all ReliabilityLane verification checklists (deployment, code, security, content, data). Free." },
+  { name: "reliabilitylane_playbooks", description: "List all ReliabilityLane incident playbooks (deploy failed, outage, dangerous tool call). Free." },
+  { name: "reliabilitylane_antipatterns", description: "List ReliabilityLane anti-patterns to avoid (trusting the green check, retrying everything, ...). Free." },
+  { name: "reliabilitylane_match", description: "Match a failure symptom to a curated ReliabilityLane pattern (retry hammering, unverified completion, lost context, wrong math, ...). 1 credit." },
+  { name: "reliabilitylane_retry_plan", description: "Plan a retry for an error: classification + backoff strategy (transient, rate limit, timeout). 1 credit." },
+  { name: "reliabilitylane_verify", description: "Verify work against a curated checklist (deployment, code, security, content, data) and return a pass/incomplete/fail verdict. 1 credit." },
+  { name: "reliabilitylane_incident", description: "Find the incident playbook for a failure (deploy failed, outage detected, dangerous tool call caught). 2 credits." },
+  { name: "skills_generate_github_profile", description: "Generate an installable AI skill from a public GitHub profile. Provide a GitHub username." },
+  { name: "skills_generate_github_repo", description: "Generate an installable AI skill from a public GitHub repository. Provide the full repo URL." },
+  { name: "skills_generate_docs", description: "Generate an installable AI skill from a documentation URL. Provide the full docs URL." },
+  { name: "skills_generate_text", description: "Generate an installable AI skill from raw text content. Provide a name and the text content." },
+  { name: "skills_generate_recording", description: "Generate an installable AI skill from a screen recording. Provide a video URL and optional frame descriptions." },
+  { name: "skills_export_cursor", description: "Export a generated skill as Cursor-compatible files (SKILL.md, .cursorrules). Provide the skill object with name and skillMd." },
+  { name: "skills_export_claude", description: "Export a generated skill as Claude Code-compatible files (SKILL.md, CLAUDE.md). Provide the skill object with name and skillMd." },
+  { name: "ugclane_strategy_generate", description: "Generate a content strategy based on goals, niche, and platform." },
+  { name: "ugclane_competitor_analyze", description: "Analyze competitor content strategies and patterns." },
+  { name: "ugclane_hooks_generate", description: "Generate attention-grabbing hooks for content." },
+  { name: "ugclane_scripts_generate", description: "Generate video or post scripts for content." },
+  { name: "ugclane_accounts_plan", description: "Plan account growth strategy for a social platform." },
+  { name: "ugclane_calendar_generate", description: "Generate a content calendar for a month." },
+  { name: "ugclane_experiments_generate", description: "Design content experiments to optimize performance." },
+  { name: "ugclane_report_generate", description: "Generate a performance report for content." },
+  { name: "ugclane_export_markdown", description: "Export UGCLane output as markdown." },
+  { name: "ugclane_export_json", description: "Export UGCLane output as JSON." },
+  { name: "signallane_x_analyze", description: "Analyze X (Twitter) account metrics for growth signals" },
+  { name: "signallane_x_content_plan", description: "Generate a weekly content strategy for X" },
+  { name: "signallane_x_post_drafts", description: "Generate post drafts for X" },
+  { name: "signallane_x_experiments", description: "Design content experiments for X" },
+  { name: "webdatalane_fetch", description: "Fetch a webpage by URL and return its HTML and text content." },
+  { name: "webdatalane_extract", description: "Extract all content from a webpage: markdown, metadata, links, headings, images, JSON-LD, and tables." },
+  { name: "webdatalane_markdown", description: "Convert a webpage or HTML to clean markdown. Optionally strip navigation elements." },
+  { name: "webdatalane_metadata", description: "Extract metadata from a webpage: title, description, canonical, OpenGraph, Twitter card, and JSON-LD count." },
+  { name: "webdatalane_links", description: "Extract all links from a webpage, classified as internal or external." },
+  { name: "webdatalane_structured", description: "Extract structured data fields from a webpage using a schema and hints." },
+  { name: "webdatalane_crawl_plan", description: "Generate a crawl plan from a seed URL, discovering internal and external links for multi-page extraction." },
+  { name: "webdatalane_screenshot", description: "Capture a screenshot of a webpage. Note: not available in v0.1, returns BROWSER_RENDERING_NOT_AVAILABLE." },
+  { name: "signallane_x_report", description: "Generate a full X growth intelligence report" },
+  { name: "crawlerlane_logs_ingest", description: "Ingest access logs from a website you own. Logs may contain sensitive data — redact IPs before sending. Bot classification is heuristic." },
+  { name: "crawlerlane_bots_classify", description: "Classify a user-agent as bot or human. Heuristic only — not guaranteed identity." },
+  { name: "crawlerlane_pages_analyze", description: "Analyze crawl coverage and bot traffic by page for a domain you own." },
+  { name: "crawlerlane_404_analyze", description: "Find missing pages requested by bots and crawlers on a domain you own." },
+  { name: "crawlerlane_ai_visibility_score", description: "Score AI visibility for a domain you own based on bot crawl signals." },
+  { name: "crawlerlane_report_generate", description: "Generate a weekly crawler intelligence report for a domain you own." },
+  { name: "crawlerlane_sitemap_suggest", description: "Suggest sitemap entries and redirects based on crawl and 404 signals." },
+  { name: "crawlerlane_robots_audit", description: "Audit robots.txt for AI crawler and search engine visibility." },
+  { name: "crawlerlane_export_markdown", description: "Export a CrawlerLane report as markdown." },
+  { name: "crawlerlane_export_json", description: "Export a CrawlerLane report as JSON." },
+  { name: "opensourcelane_repo_analyze", description: "Analyze an open-source repo for adoption fit. Risk scores are heuristic — not security audits." },
+  { name: "opensourcelane_alternatives_find", description: "Find open-source alternatives to expensive SaaS tools." },
+  { name: "opensourcelane_migration_plan", description: "Generate a migration plan from SaaS to open-source. Not legal or financial advice." },
+  { name: "opensourcelane_cost_estimate", description: "Estimate cost savings from switching to open-source. Estimates only — not financial advice." },
+  { name: "opensourcelane_risk_score", description: "Score adoption risk heuristically. Not a security audit." },
+  { name: "opensourcelane_brief_generate", description: "Generate an adoption brief for an open-source tool." },
+  { name: "opensourcelane_tools_compare", description: "Compare multiple open-source tools side by side." },
+  { name: "opensourcelane_deployment_plan", description: "Generate a self-hosting deployment plan." },
+  { name: "opensourcelane_license_audit", description: "Audit license obligations. Not legal advice." },
+  { name: "opensourcelane_export_markdown", description: "Export OpenSourceLane analysis as markdown." },
+  { name: "opensourcelane_export_json", description: "Export OpenSourceLane analysis as JSON." },
+  { name: "forgecad_design_generate", description: "Generate parametric CAD design with OpenSCAD, BOM, and manufacturing notes. Human engineering review required. Not certified engineering software." },
+  { name: "forgecad_openscad_generate", description: "Generate parametric OpenSCAD script. Draft only — human review required." },
+  { name: "forgecad_bom_generate", description: "Generate bill of materials for a CAD project." },
+  { name: "forgecad_cutlist_generate", description: "Generate cut list for frames and panels." },
+  { name: "forgecad_assembly_plan", description: "Generate assembly plan steps. Human review required." },
+  { name: "forgecad_printability_check", description: "Check FDM 3D printability heuristically. Not a certified DFM analysis." },
+  { name: "forgecad_manufacturability_check", description: "Check manufacturability for laser cutting, sheet metal, etc. Informational only." },
+  { name: "forgecad_design_review", description: "Generate design review report. Not a certified engineering review." },
+  { name: "forgecad_material_estimate", description: "Estimate material usage for a design." },
+  { name: "forgecad_tools_detect", description: "Detect OpenSCAD and FreeCAD installation." },
+  { name: "forgecad_render_openscad", description: "Render OpenSCAD to STL/PNG if OpenSCAD is installed. Returns TOOL_NOT_AVAILABLE otherwise." },
+  { name: "forgecad_export_markdown", description: "Export ForgeCAD design report as markdown." },
+  { name: "forgecad_export_json", description: "Export ForgeCAD design as JSON." },
+  { name: "replylane_opportunity_score", description: "Score an X tweet for strategic reply opportunity (timing, author size, competition)." },
+  { name: "replylane_targets_rank", description: "Rank X accounts for reply targeting in the 5-20x follower sweet spot." },
+  { name: "replylane_replies_draft", description: "Draft strategic X replies (data, experience, insight, question, etc.). Human review required." },
+  { name: "replylane_replies_risk", description: "Score X reply deboost/spam risk before posting." },
+  { name: "replylane_posts_grok_check", description: "Check Grok/constructive tone compatibility for an X post or reply draft." },
+  { name: "replylane_activity_audit", description: "Audit 70/30 reply vs post activity balance." },
+  { name: "replylane_feeds_migrate", description: "Plan migration from X Communities to XChat groups and Custom Timelines." },
+  { name: "replylane_export_markdown", description: "Export ReplyLane report as markdown." },
+  { name: "replylane_export_json", description: "Export ReplyLane report as JSON." },
+  { name: "tradia_health", description: "Check Tradia API health and available endpoints." },
+  { name: "tradia_agent_plan", description: "Generate a personalized trading plan based on goals, risk tolerance, and market preferences. Not financial advice." },
+  { name: "tradia_market_analyze", description: "Analyze a market or asset for trading opportunities using technical indicators. Not financial advice." },
+  { name: "tradia_signal_evaluate", description: "Evaluate a trading signal or setup for quality and risk. Not financial advice." },
+  { name: "tradia_risk_check", description: "Check trade risk parameters including R-multiple, risk percentage, and position sizing. Not financial advice." },
+  { name: "tradia_trade_propose", description: "Propose a trade setup with entry, stop loss, take profit, and rationale. Not financial advice." },
+  { name: "tradia_trade_journal", description: "Journal a trade with entry/exit details, P&L, and reflections. Not financial advice." },
+  { name: "tradia_portfolio_report", description: "Generate a portfolio health report with allocation analysis and diversification scoring. Not financial advice." },
+  { name: "tradia_performance_analyze", description: "Analyze trading performance including win rate, profit factor, drawdown, and Sharpe-like scoring. Not financial advice." },
+  { name: "tradia_public_update_generate", description: "Generate a public trading update/loss-porn post for social platforms based on recent trades. Not financial advice." },
+  { name: "tradia_backtest_simulate", description: "Simulate a trading strategy backtest over historical data. Not financial advice." },
+  { name: "tradia_accountability_card", description: "Generate an accountability card reviewing trade discipline, mistakes, and lessons. Not financial advice." },
+  { name: "tradia_export_markdown", description: "Export Tradia trade data as a formatted markdown report." },
+  { name: "tradia_export_json", description: "Export Tradia trade data as JSON." },
+  { name: "codra_review", description: "Review code for anti-patterns, raw loops, off-by-one errors, and suggest modern alternatives." },
+  { name: "doculane_extract", description: "Extract structured data from documents (PDF, images, scans) using natural language prompts." }
+]
+
 async function routeHandler(method, rawPath, headers, body, queryParams) {
   const path = normalizePath(rawPath)
   const requestId = makeRequestId()
@@ -458,7 +647,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return user
   }
 
-  if (method === 'OPTIONS') return withCors(respond(204, '', {}), origin)
+  if (method === 'OPTIONS') {
+    if (path === '/mcp') {
+      return respond(204, '', { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Authorization, X-Api-Key, X-Talocode-Api-Key, Content-Type' })
+    }
+    return withCors(respond(204, '', {}), origin)
+  }
 
   // Health
   if ((method === 'GET' || method === 'HEAD') && /^\/(health|\/api\/v1\/health)?$/.test(path)) {
@@ -1560,14 +1754,11 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       const db = await loadDb()
       const userId = db.api_keys[`sha256:${hashApiKey(apiKey)}`]
       if (!userId) return e(401, 'invalid_api_key', 'Invalid or expired API key')
-      const profile = db.profiles[userId]
-      if (!profile) return e(402, 'insufficient_credits', 'No active subscription or credits found')
-      const total = profile.purchased_credits_balance || 0
-      if (total < payload.credits) return e(402, 'insufficient_credits', `Insufficient credits. Required: ${payload.credits}, Balance: ${total}`)
-      profile.purchased_credits_balance -= payload.credits
+      const result = debitCredits(db, userId, payload.credits, payload.product || 'tera_api', payload.action, requestId)
+      if (!result.ok) return e(402, 'insufficient_credits', `Insufficient credits. Required: ${result.required}, Balance: ${result.balance}`)
       db.usage_events.push({ user_id: userId, product: payload.product || 'tera_api', action: payload.action, credits: payload.credits, metadata: payload.metadata || {}, created_at: new Date().toISOString() })
       await saveDb(db)
-      return r(200, ok({ ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, requestId } }, requestId))
+      return r(200, ok({ ok: true, event: { credits: payload.credits, status: 'charged', product: payload.product, action: payload.action, balance: result.balance, requestId } }, requestId))
     } catch (err) {
       return e(503, 'billing_unavailable', err.message)
     }
@@ -1717,16 +1908,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       const actionMap = { '/query': 'searchlane.query', '/news': 'searchlane.news', '/research': 'searchlane.research' }
       const credits = creditMap[sub]
       const action = actionMap[sub]
-      // Charge profile credits (JSON store)
+      // Charge credits via wallet (single source of truth)
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const bal = profile.purchased_credits_balance || 0
-        if (bal < credits) {
-          return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: bal, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'searchlane', action, requestId)
+        if (!dc.ok) {
+          return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: dc.balance, meta: { requestId } })
         }
-        profile.purchased_credits_balance = bal - credits
         db.usage_events.push({
           user_id: userId, product: 'searchlane', action, credits,
           metadata: { query, limit }, created_at: new Date().toISOString(), request_id: requestId,
@@ -1738,7 +1927,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         else result = await runResearch(query, { limit, fetchPages: payload.fetchPages !== false })
         return r(200, {
           ...result,
-          usage: { credits, action, remaining: profile.purchased_credits_balance },
+          usage: { credits, action, remaining: dc.balance },
           meta: { requestId },
         })
       } catch (err) {
@@ -1794,15 +1983,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
-        const result = await transcribe(payload)
-        profile.purchased_credits_balance = balance - credits
         const action = timestamps === 'none' ? 'audiolane.transcription' : 'audiolane.transcription.timestamps'
+        const dc = debitCredits(db, userId, credits, 'audiolane', action, requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
+        const result = await transcribe(payload)
         db.usage_events.push({ user_id: userId, product: 'audiolane', action, credits, metadata: { mimeType: payload.mimeType, timestamps, source: payload.audioUrl ? 'url' : 'base64' }, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, { ...result, usage: { credits, action, remaining: profile.purchased_credits_balance }, meta: { requestId } })
+        return r(200, { ...result, usage: { credits, action, remaining: dc.balance }, meta: { requestId } })
       } catch (err) {
         return e(err.code === 'provider_unavailable' ? 503 : 502, err.code || 'transcription_error', err.message || 'Transcription failed')
       }
@@ -1845,12 +2032,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const bal = profile.purchased_credits_balance || 0
-        if (bal < credits) {
-          return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: bal, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'calclane', action, requestId)
+        if (!dc.ok) {
+          return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         }
-        profile.purchased_credits_balance = bal - credits
         db.usage_events.push({
           user_id: userId, product: 'calclane', action, credits,
           metadata: sub === '/evaluate'
@@ -1872,7 +2057,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           })
           return r(result.ok ? 200 : 422, {
             ...result,
-            usage: { credits, action, remaining: profile.purchased_credits_balance },
+            usage: { credits, action, remaining: dc.balance },
             meta: { requestId },
           })
         }
@@ -1885,7 +2070,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         })
         return r(result.ok ? 200 : 422, {
           ...result,
-          usage: { credits, action, remaining: profile.purchased_credits_balance },
+          usage: { credits, action, remaining: dc.balance },
           meta: { requestId },
         })
       } catch (err) {
@@ -1937,13 +2122,94 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
   // ── MCP ──────────────────────────────────────────────────────────
-  if (path === '/mcp' && method === 'POST') {
-    const payload = jsonBody(body)
-    if (!payload) return e(400, 'invalid_request', 'MCP request body required')
-    return r(200, ok({
-      mcp: { serverInfo: { name: 'stacklane-mcp', version: '0.1.0' }, tools: [] },
-      message: 'Stacklane MCP endpoint is wired. Full MCP tool definitions are available when product services are connected.',
-    }, requestId))
+  if (path === '/mcp') {
+    const mcpCors = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Authorization, X-Api-Key, X-Talocode-Api-Key, Content-Type',
+    }
+    const mcpRpc = (status, obj) => respond(status, obj, mcpCors)
+
+    // GET /mcp - health / discovery
+    if (method === 'GET') {
+      return mcpRpc(200, {
+        ok: true,
+        service: 'talocode-mcp',
+        version: '0.1.0',
+        endpoint: '/mcp',
+        transport: 'streamable-http',
+        auth: 'TALOCODE_API_KEY',
+        tools: MCP_TOOLS.length,
+      })
+    }
+
+    // POST /mcp - JSON-RPC
+    if (method === 'POST') {
+      const payload = jsonBody(body)
+      if (!payload || typeof payload !== 'object') {
+        return mcpRpc(400, { jsonrpc: '2.0', error: { code: -32700, message: 'Parse error: invalid JSON-RPC body' }, id: null })
+      }
+      const rpcId = payload.id ?? null
+      const rpcMethod = payload.method
+
+      if (rpcMethod === 'initialize') {
+        return mcpRpc(200, {
+          jsonrpc: '2.0',
+          id: rpcId,
+          result: {
+            protocolVersion: payload.params && payload.params.protocolVersion ? payload.params.protocolVersion : '2024-11-05',
+            capabilities: { tools: { listChanged: false } },
+            serverInfo: { name: 'talocode-mcp', version: '0.1.0' },
+          },
+        })
+      }
+
+      if (rpcMethod === 'notifications/initialized' || rpcMethod === 'ping') {
+        return mcpRpc(200, { jsonrpc: '2.0', id: rpcId, result: {} })
+      }
+
+      if (rpcMethod === 'tools/list') {
+        return mcpRpc(200, {
+          jsonrpc: '2.0',
+          id: rpcId,
+          result: {
+            tools: MCP_TOOLS.map((t) => ({
+              name: t.name,
+              description: t.description,
+              inputSchema: { type: 'object', additionalProperties: true, properties: {} },
+            })),
+            nextCursor: null,
+          },
+        })
+      }
+
+      if (rpcMethod === 'tools/call') {
+        let auth = { ok: false }
+        try {
+          auth = await requireApiKey(headers)
+        } catch (err) {
+          auth = { ok: false, message: 'API key storage unavailable; retry with a valid TALOCODE_API_KEY.' }
+        }
+        if (!auth.ok) {
+          return mcpRpc(200, { jsonrpc: '2.0', id: rpcId, result: { content: [{ type: 'text', text: `MCP tools/call requires a valid TALOCODE_API_KEY: ${auth.message}` }], isError: true } })
+        }
+        const name = payload.params && payload.params.name
+        const args = (payload.params && payload.params.arguments) || {}
+        const tool = MCP_TOOLS.find((t) => t.name === name)
+        if (!tool) {
+          return mcpRpc(200, { jsonrpc: '2.0', id: rpcId, result: { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true } })
+        }
+        return mcpRpc(200, {
+          jsonrpc: '2.0',
+          id: rpcId,
+          result: { content: [{ type: 'text', text: `${name} is defined on api.talocode.site/mcp. Underlying product service wiring is being connected; arguments received: ${JSON.stringify(args)}` }], isError: false },
+        })
+      }
+
+      return mcpRpc(400, { jsonrpc: '2.0', error: { code: -32601, message: `Method not supported: ${rpcMethod}` }, id: rpcId })
+    }
+
+    return mcpRpc(405, { jsonrpc: '2.0', error: { code: -32600, message: 'Method not allowed' }, id: null })
   }
 
   // ── Cloud health (expanded) ────────────────────────────────────────
@@ -2143,14 +2409,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
-        const result = runner()
-        profile.purchased_credits_balance = balance - credits
+        const result = debitCredits(db, userId, credits, 'verifylane', action, requestId)
+        if (!result.ok) return r(402, { ok: false, error: 'insufficient_credits', required: result.required, available: result.balance, meta: { requestId } })
+        const output = runner()
         db.usage_events.push({ user_id: userId, product: 'verifylane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...output, usage: { credits, action, remaining: result.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'verify failed')
       }
@@ -2204,14 +2468,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         const payload = jsonBody(body) || {}
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
+        const wallet = resolveWallet(db, userId)
+        const balance = wallet ? (wallet.balance || 0) : (db.profiles[userId]?.purchased_credits_balance || 0)
         const result = checkSpendCap({ ...payload, balanceCredits: payload.balanceCredits ?? balance })
         if (result.allowed) {
           db.usage_events.push({ user_id: userId, product: 'spendcaps', action: 'spendcaps.check', credits: 1, metadata: { action: payload.action || '' }, created_at: new Date().toISOString(), request_id: requestId })
           await saveDb(db)
         }
-        return r(200, ok({ ...result, usage: { credits: 1, action: 'spendcaps.check', remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits: 1, action: 'spendcaps.check', remaining: balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'check failed')
       }
@@ -2236,15 +2500,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
         const credits = 2
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'policylane', 'policylane.check', requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = checkPolicy(payload)
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'policylane', action: 'policylane.check', credits, metadata: { action: payload.action }, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action: 'policylane.check', remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits, action: 'policylane.check', remaining: dc.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'check failed')
       }
@@ -2256,15 +2518,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
         const credits = 1
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'policylane', 'policylane.redact', requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = redact(payload.value ?? payload.payload, payload.patterns)
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'policylane', action: 'policylane.redact', credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ product: 'policylane', version: POLICYLANE_VERSION, ...result, usage: { credits, action: 'policylane.redact', remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ product: 'policylane', version: POLICYLANE_VERSION, ...result, usage: { credits, action: 'policylane.redact', remaining: dc.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'redact failed')
       }
@@ -2304,14 +2564,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'reliabilitylane', action, requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = runner()
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'reliabilitylane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits, action, remaining: dc.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'reliabilitylane call failed')
       }
@@ -2368,14 +2626,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'doculane', action, requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = await runner()
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'doculane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits, action, remaining: dc.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'doculane call failed')
       }
@@ -2428,14 +2684,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'cliploop', action, requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = await runner()
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'cliploop', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits, action, remaining: dc.balance } }, requestId))
       } catch (err) {
         if (err.message && (err.message.includes('No AI provider configured') || err.message.includes('ClipLoop provider'))) {
           return e(503, 'provider_unavailable', err.message)
@@ -2513,14 +2767,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'wiki', action, requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = await runner(db)
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'wiki', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits, action, remaining: dc.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'wiki call failed')
       }
@@ -2565,14 +2817,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       try {
         const db = await loadDb()
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-        const balance = profile.purchased_credits_balance || 0
-        if (balance < credits) return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } })
+        const dc = debitCredits(db, userId, credits, 'videolane', action, requestId)
+        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = await runner()
-        profile.purchased_credits_balance = balance - credits
         db.usage_events.push({ user_id: userId, product: 'videolane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action, remaining: profile.purchased_credits_balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits, action, remaining: dc.balance } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'videolane call failed')
       }
@@ -2626,13 +2876,11 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       if (!auth.ok) return { ok: false, response: e(auth.status, auth.code, auth.message) }
       const db = await loadDb()
       const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-      const profile = db.profiles[userId] || (db.profiles[userId] = { purchased_credits_balance: 10000, free_plan_credits_used: 0 })
-      const balance = profile.purchased_credits_balance || 0
-      if (balance < credits) return { ok: false, response: r(402, { ok: false, error: 'insufficient_credits', required: credits, available: balance, meta: { requestId } }) }
-      profile.purchased_credits_balance = balance - credits
+      const dc = debitCredits(db, userId, credits, 'llmgateway', action, requestId)
+      if (!dc.ok) return { ok: false, response: r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } }) }
       db.usage_events.push({ user_id: userId, product: 'llmgateway', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
       await saveDb(db)
-      return { ok: true, userId, remaining: profile.purchased_credits_balance }
+      return { ok: true, userId, remaining: dc.balance }
     }
 
     if (method === 'GET' && sub === '/models') {
