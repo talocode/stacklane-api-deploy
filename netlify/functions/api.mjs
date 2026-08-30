@@ -1,6 +1,7 @@
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto'
 import fs from 'node:fs'
 import pg from 'pg'
+import { createTcodeStore, publicConfig as tcodePublicConfig, TcodeError, TCODE_SCHEMA_SQL } from './tcode.mjs'
 
 const DB_PATH = '/tmp/stacklane-db.json'
 const BLOB_STORE = 'stacklane-cloud'
@@ -11,6 +12,7 @@ const { Pool } = pg
 let dbCache = null
 let pool = null
 let postgresReady = null
+let tcodeStore = null
 
 function getPool() {
   if (!process.env.DATABASE_URL) {
@@ -27,12 +29,36 @@ function getPool() {
   return pool
 }
 
+function getTcodeStore() {
+  if (!tcodeStore) {
+    tcodeStore = createTcodeStore({ pool: getPool(), makeId })
+  }
+  return tcodeStore
+}
+
+function syncCacheWallet(db, wallet) {
+  if (!db || !wallet?.projectId) return
+  if (!db.wallets) db.wallets = {}
+  db.wallets[wallet.projectId] = {
+    ...(db.wallets[wallet.projectId] || {}),
+    ...wallet,
+  }
+}
+
+function tcodeFail(error, e, requestId) {
+  if (error instanceof TcodeError) return e(error.status, error.code, error.message)
+  console.error('[tcode]', error instanceof Error ? error.message : error)
+  return e(503, 'tcode_unavailable', 'Could not complete $TCODE request')
+}
+
 async function ensurePostgres() {
   if (!postgresReady) {
     postgresReady = (async () => {
       const client = await getPool().connect()
       try {
         await client.query('SELECT 1 FROM stacklane.users LIMIT 1')
+        const statements = TCODE_SCHEMA_SQL.split(';').map((part) => part.trim()).filter(Boolean)
+        for (const sql of statements) await client.query(sql)
       } finally {
         client.release()
       }
@@ -165,6 +191,11 @@ async function saveDb(db) {
   const client = await getPool().connect()
   try {
     await client.query('BEGIN')
+    try {
+      await getTcodeStore().mergeSqlWalletsIntoCache(db)
+    } catch (error) {
+      console.error('[tcode] merge wallets failed', error instanceof Error ? error.message : error)
+    }
     await client.query('DELETE FROM stacklane.sessions')
     await client.query('DELETE FROM stacklane.usage_events')
     await client.query('DELETE FROM stacklane.transactions')
@@ -268,30 +299,6 @@ function makeRequestId() {
 function slugify(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
-
-// $TCODE hold tiers → monthly API credits. Product-anchored: every grant maps to
-// a real StackLane credit balance, never a speculative promise.
-const TCODE_TIERS = [
-  { key: 'explorer',  min: 10000,   credits: 1000 },
-  { key: 'builder',   min: 1000000, credits: 10000 },
-  { key: 'ecosystem', min: 10000000, credits: 100000 },
-  { key: 'partner',   min: 50000000, credits: 500000 },
-].map((t) => ({ ...t, tcodeTokens: Math.floor(t.min / 10000) }))
-// NOTE: raw Solana balances include 6 decimals (1 TCODE = 1_000_000 raw lamports).
-// Tier thresholds are expressed in raw units above (ex: 10_000 raw = 10 TCODE).
-// floor() to avoid fractional-token threshold edge cases.
-
-// Contributor airdrop rewards (one-time, $TCODE).
-const TCODE_AIRDROPS = {
-  'pr': 5000,            // 0.5 TCODE for a merged PR (raw units)
-  'docs': 2000,          // 0.2 TCODE for docs/triage
-  'first': 1000,         // 0.1 TCODE first-time contributor
-  'security': 20000,     // 2 TCODE verified security bug
-}
-
-// Fixed redemption floor: 1_000_000 raw (1 TCODE) → 10 credits, capped per month.
-const TCODE_REDEEM = { rate: 0.00001, maxCreditsPerMonth: 5000 }
-// rate: credits per raw unit (10 credits / 1_000_000 raw = 0.00001).
 
 // ── Unified balance helpers ──────────────────────────────────────────
 // Wallet is the single source of truth for credits.  Deposits (topup,
@@ -1157,8 +1164,6 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (!db.cloud_projects) db.cloud_projects = []
     if (!db.cloud_api_keys) db.cloud_api_keys = []
     if (!db.topups) db.topups = []
-    if (!db.tcode_links) db.tcode_links = []
-    if (!db.tcode_receipts) db.tcode_receipts = []
     return db
   }
 
@@ -1422,7 +1427,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const db = ensureCloudShape(await loadDb())
     const project = db.cloud_projects?.find((p) => p.id === projectId)
     if (project && project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
-    const wallet = db.wallets[projectId]
+    let wallet = null
+    try {
+      wallet = await getTcodeStore().readWallet(projectId)
+    } catch {
+      wallet = null
+    }
+    if (!wallet) wallet = db.wallets[projectId]
     if (!wallet) return e(404, 'not_found', 'Wallet not found')
     return r(200, ok({
       id: wallet.id,
@@ -1443,7 +1454,14 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = await loadDb()
-    return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))).slice(0, limit), requestId))
+    const project = db.cloud_projects?.find((p) => p.id === projectId)
+    if (project && project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const rows = await getTcodeStore().listTransactions(projectId, limit)
+      return r(200, ok(rows, requestId))
+    } catch {
+      return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))).slice(0, limit), requestId))
+    }
   }
 
   // GET /api/v1/cloud/usage/events
@@ -1642,158 +1660,115 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }, requestId))
   }
 
-  // ─── $TCODE: product-anchored utility ────────────────────────────
-  // These endpoints tie the $TCODE token to real StackLane API credits:
-  // hold-to-earn tier grants + contributor airdrops. All grants are plain
-  // credit additions to the existing wallet engine. No speculative value.
-
-  // GET /api/v1/cloud/tcode (public) — tier table + token config
-  if (method === 'GET' && path === '/api/v1/cloud/tcode') {
-    return r(200, {
-      ok: true,
-      request_id: requestId,
-      data: {
-        token: 'TCODE',
-        mint: '6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory',
-        tiers: TCODE_TIERS.map((t) => ({ key: t.key, minTCODE: t.tcodeTokens, monthlyCredits: t.credits })),
-        airdrops: {
-          pr: TCODE_AIRDROPS.pr / 10000,
-          docs: TCODE_AIRDROPS.docs / 10000,
-          first: TCODE_AIRDROPS.first / 10000,
-          security: TCODE_AIRDROPS.security / 10000,
-        },
-        redemption: { perTCODE: TCODE_REDEEM.rate * 10000, maxCreditsPerMonth: TCODE_REDEEM.maxCreditsPerMonth },
-      },
-    }, requestId)
+  // ─── $TCODE hold-to-earn (signed link + on-chain holdings + monthly claim)
+  async function requireOwnedCloudProject(projectId) {
+    if (!projectId) return { error: e(400, 'invalid_request', 'projectId is required') }
+    const db = ensureCloudShape(await loadDb())
+    const project = db.cloud_projects.find((p) => p.id === projectId)
+    if (!project) return { error: e(404, 'not_found', 'Project not found') }
+    return { db, project }
   }
 
-  // POST /api/v1/cloud/tcode/link — link a Solana wallet to a Talocode project.
+  if (method === 'GET' && path === '/api/v1/cloud/tcode') {
+    return r(200, { ok: true, request_id: requestId, data: tcodePublicConfig() }, requestId)
+  }
+
+  if (method === 'POST' && path === '/api/v1/cloud/tcode/challenge') {
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body) || {}
+    const owned = await requireOwnedCloudProject(payload.projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const challenge = await getTcodeStore().createChallenge({ userId: user.id, projectId: payload.projectId })
+      return r(200, ok(challenge, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
+  }
+
   if (method === 'POST' && path === '/api/v1/cloud/tcode/link') {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
-    if (!payload || !payload.projectId || !payload.walletAddress) {
-      return e(400, 'invalid_request', 'projectId and walletAddress are required')
+    if (!payload || !payload.projectId || !payload.walletAddress || !payload.signature || !payload.nonce) {
+      return e(400, 'invalid_request', 'projectId, walletAddress, signature, and nonce are required')
     }
-    const db = ensureCloudShape(await loadDb())
-    const project = db.cloud_projects.find((p) => p.id === payload.projectId)
-    if (!project) return e(404, 'not_found', 'Project not found')
-    if (project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
-    const existing = db.tcode_links.find((l) => l.projectId === payload.projectId)
-    const now = new Date().toISOString()
-    if (existing) {
-      existing.walletAddress = payload.walletAddress
-      existing.updatedAt = now
-      existing.signature = payload.signature || existing.signature
-    } else {
-      db.tcode_links.push({ id: makeId('tclk'), projectId: payload.projectId, walletAddress: payload.walletAddress, signature: payload.signature || null, lastTier: null, lastTierAt: null, createdAt: now, updatedAt: now })
+    const owned = await requireOwnedCloudProject(payload.projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const linked = await getTcodeStore().linkWallet({
+        userId: user.id,
+        projectId: payload.projectId,
+        walletAddress: String(payload.walletAddress).trim(),
+        signature: String(payload.signature),
+        nonce: String(payload.nonce),
+      })
+      return r(200, ok(linked, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
     }
-    await saveDb(db)
-    return r(200, ok({ linked: true }, requestId))
   }
 
-  // GET /api/v1/cloud/tcode/holdings — estimated tier for a linked wallet.
   if (method === 'GET' && path === '/api/v1/cloud/tcode/holdings') {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
-    const db = ensureCloudShape(await loadDb())
-    const q = new URL(url, 'http://x').searchParams
-    const projectId = q.get('projectId')
-    const rawBalance = Number(q.get('rawBalance') || 0)
-    if (!projectId) return e(400, 'invalid_request', 'projectId is required')
-    const link = db.tcode_links.find((l) => l.projectId === projectId)
-    if (!link || db.cloud_projects.find((p) => p.id === projectId)?.ownerId !== user.id) {
-      return e(404, 'not_found', 'No linked wallet for this project')
+    const projectId = query.projectId
+    const owned = await requireOwnedCloudProject(projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    if (query.rawBalance != null) {
+      return e(400, 'invalid_request', 'rawBalance is not accepted; holdings are read on-chain')
     }
-    const tier = TCODE_TIERS.slice().reverse().find((t) => rawBalance >= t.min)
-    return r(200, ok({
-      projectId, walletAddress: link.walletAddress,
-      rawBalance, tcodeTokens: Math.floor(rawBalance / 10000),
-      tier: tier ? { key: tier.key, minTCODE: tier.tcodeTokens, monthlyCredits: tier.credits } : null,
-      lastTier: link.lastTier, lastTierAt: link.lastTierAt,
-    }, requestId))
+    try {
+      const holdings = await getTcodeStore().getHoldings(projectId)
+      return r(200, ok(holdings, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
   }
 
-  // POST /api/v1/cloud/tcode/claim — contributor airdrop + monthly tier grant +
-  // monthly redemption floor. (Reference implementation; wallet signature checks
-  // and a server-side Solana RPC feed are the production hardening steps.)
   if (method === 'POST' && path === '/api/v1/cloud/tcode/claim') {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
-    const db = ensureCloudShape(await loadDb())
-    const project = db.cloud_projects.find((p) => p.id === payload.projectId)
-    if (!project) return e(404, 'not_found', 'Project not found')
-    if (project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
-    const wallet = db.wallets[payload.projectId]
-    if (!wallet) return e(404, 'not_found', 'Wallet not found')
-    const link = db.tcode_links.find((l) => l.projectId === payload.projectId)
-    const now = new Date().toISOString()
-    const month = now.slice(0, 7) // YYYY-MM
-
-    // 1) Contributor airdrop (one-time)
-    let airdropCredits = 0
-    if (payload.airdrop) {
-      const kind = String(payload.airdrop.kind || '')
-      const reference = String(payload.airdrop.reference || '')
-      const tokens = TCODE_AIRDROPS[kind]
-      if (tokens) {
-        const already = db.tcode_receipts.some((r) => r.type === 'airdrop' && r.reference === reference && r.walletId === wallet.id)
-        if (!already && reference) {
-          airdropCredits = Math.round(tokens * (10 / 10000)) // 10 credits per 1 TCODE
-          wallet.balance = (wallet.balance || 0) + airdropCredits
-          wallet.lifetimeCredits = (wallet.lifetimeCredits || 0) + airdropCredits
-          wallet.updatedAt = now
-          db.transactions.push({ id: makeId('ctxn'), walletId: wallet.id, type: 'tcode_airdrop', creditsDelta: airdropCredits, balanceAfter: wallet.balance, product: null, action: 'airdrop', reference, metadata: { kind, walletAddress: link?.walletAddress || null }, createdAt: now })
-          db.tcode_receipts.push({ id: makeId('tcr'), type: 'airdrop', reference, walletId: wallet.id, credits: airdropCredits, createdAt: now })
+    if (payload.rawBalance != null || payload.redeemRaw != null || payload.airdrop != null) {
+      return e(400, 'invalid_request', 'Client-supplied balances and airdrops are not accepted')
+    }
+    const owned = await requireOwnedCloudProject(payload.projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const result = await getTcodeStore().claim(payload.projectId)
+      if (result.wallet) {
+        syncCacheWallet(owned.db, result.wallet)
+        if (Array.isArray(owned.db.transactions) && result.granted > 0) {
+          owned.db.transactions.push({
+            id: makeId('ctxn'),
+            walletId: result.wallet.id,
+            type: 'tcode_tier',
+            creditsDelta: result.granted,
+            balanceAfter: result.balance,
+            product: null,
+            action: 'tier',
+            reference: `${result.period}:${result.tier?.key || 'tier'}`,
+            metadata: { period: result.period, tier: result.tier?.key || null },
+            createdAt: new Date().toISOString(),
+          })
         }
       }
+      return r(200, ok({
+        granted: result.granted,
+        alreadyClaimed: result.alreadyClaimed,
+        reason: result.reason,
+        period: result.period,
+        tier: result.tier,
+        tcodeTokens: result.tcodeTokens,
+        balance: result.balance,
+        wallet: result.wallet,
+      }, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
     }
-
-    // 2) Monthly tier grant (hold-to-earn)
-    let tierCredits = 0
-    if (payload.rawBalance != null) {
-      const rawBalance = Number(payload.rawBalance) || 0
-      const tier = TCODE_TIERS.slice().reverse().find((t) => rawBalance >= t.min)
-      if (tier) {
-        const alreadyThisMonth = db.tcode_receipts.some((r) => r.type === 'tier' && r.walletId === wallet.id && r.reference === `${month}:${tier.key}`)
-        if (!alreadyThisMonth) {
-          tierCredits = tier.credits
-          wallet.balance = (wallet.balance || 0) + tierCredits
-          wallet.lifetimeCredits = (wallet.lifetimeCredits || 0) + tierCredits
-          wallet.updatedAt = now
-          db.transactions.push({ id: makeId('ctxn'), walletId: wallet.id, type: 'tcode_tier', creditsDelta: tierCredits, balanceAfter: wallet.balance, product: null, action: 'tier', reference: `${month}:${tier.key}`, metadata: { tier: tier.key, rawBalance, walletAddress: link?.walletAddress || null }, createdAt: now })
-          db.tcode_receipts.push({ id: makeId('tcr'), type: 'tier', reference: `${month}:${tier.key}`, walletId: wallet.id, credits: tierCredits, createdAt: now })
-          if (link) { link.lastTier = tier.key; link.lastTierAt = now }
-        }
-      }
-    }
-
-    // 3) Redemption floor: $TCODE → credits, capped monthly
-    let redeemCredits = 0
-    if (payload.redeemRaw) {
-      const redeemRaw = Number(payload.redeemRaw) || 0
-      if (redeemRaw > 0) {
-        const monthUsed = db.tcode_receipts
-          .filter((r) => r.type === 'redeem' && r.walletId === wallet.id && r.reference.startsWith(month))
-          .reduce((s, r) => s + r.credits, 0)
-        const room = Math.max(0, TCODE_REDEEM.maxCreditsPerMonth - monthUsed)
-        const rawCreditable = redeemRaw * TCODE_REDEEM.rate
-        const eligible = Math.floor(Math.min(rawCreditable, room))
-        if (eligible > 0) {
-          redeemCredits = eligible
-          wallet.balance = (wallet.balance || 0) + redeemCredits
-          wallet.lifetimeCredits = (wallet.lifetimeCredits || 0) + redeemCredits
-          wallet.updatedAt = now
-          db.transactions.push({ id: makeId('ctxn'), walletId: wallet.id, type: 'tcode_redeem', creditsDelta: redeemCredits, balanceAfter: wallet.balance, product: null, action: 'redeem', reference: `${month}:${makeId('rdm')}`, metadata: { rawRedeemed: redeemRaw, walletAddress: link?.walletAddress || null }, createdAt: now })
-          db.tcode_receipts.push({ id: makeId('tcr'), type: 'redeem', reference: `${month}:${makeId('rdm')}`, walletId: wallet.id, credits: redeemCredits, createdAt: now })
-        }
-      }
-    }
-
-    await saveDb(db)
-    return r(200, ok({
-      granted: { airdrop: airdropCredits, tier: tierCredits, redeem: redeemCredits },
-      balance: wallet.balance,
-    }, requestId))
   }
 
   // ─── Usage charge (existing) ─────────────────────────────────────
