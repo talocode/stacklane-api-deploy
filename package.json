@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@netlify/blobs": "^9.1.1",
-    "pg": "^8.16.3",
-    "pg-cloudflare": "^1.4.0"
+    "pg": "^8.16.3"
   }
 }
