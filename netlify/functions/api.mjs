@@ -116,15 +116,15 @@ async function loadDb() {
       database.query('SELECT id, project_id, credits, amount_usd, status, provider, created_at, updated_at FROM stacklane.topups'),
     ])
     dbCache = {
-      users: users.rows.map((row) => ({ id: row.id, email: row.email, name: row.name, passwordHash: row.password_hash, status: row.status, lastLoginAt: row.last_login_at, createdAt: row.created_at, updatedAt: row.updated_at })),
-      sessions: Object.fromEntries(sessions.rows.map((row) => [row.token_hash, { userId: row.user_id, createdAt: row.created_at }])),
-      cloud_projects: projects.rows.map((row) => ({ id: row.id, ownerId: row.owner_id, name: row.name, slug: row.slug, createdAt: row.created_at, updatedAt: row.updated_at })),
-      cloud_api_keys: keys.rows.map((row) => ({ id: row.id, projectId: row.project_id, userId: row.user_id, name: row.name, prefix: row.prefix, keyHash: row.key_hash, mode: row.mode, status: row.status, lastUsedAt: row.last_used_at, createdAt: row.created_at, updatedAt: row.updated_at })),
+      users: users.rows.map((row) => ({ id: row.id, email: row.email, name: row.name, passwordHash: row.password_hash, status: row.status, lastLoginAt: iso(row.last_login_at), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) })),
+      sessions: Object.fromEntries(sessions.rows.map((row) => [row.token_hash, { userId: row.user_id, createdAt: iso(row.created_at) }])),
+      cloud_projects: projects.rows.map((row) => ({ id: row.id, ownerId: row.owner_id, name: row.name, slug: row.slug, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) })),
+      cloud_api_keys: keys.rows.map((row) => ({ id: row.id, projectId: row.project_id, userId: row.user_id, name: row.name, prefix: row.prefix, keyHash: row.key_hash, mode: row.mode, status: row.status, lastUsedAt: iso(row.last_used_at), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) })),
       api_keys: Object.fromEntries(keys.rows.filter((row) => row.status === 'active').map((row) => [`sha256:${row.key_hash}`, row.user_id])),
-      wallets: Object.fromEntries(wallets.rows.map((row) => [row.project_id, { id: row.id, projectId: row.project_id, balance: row.balance_credits, lifetimeCredits: row.lifetime_credits, lifetimeSpend: row.lifetime_spend, freeCreditsGranted: row.free_credits_granted, createdAt: row.created_at, updatedAt: row.updated_at }])),
-      transactions: transactions.rows.map((row) => ({ id: row.id, walletId: row.wallet_id, type: row.type, creditsDelta: row.credits_delta, balanceAfter: row.balance_after, reference: row.reference, metadata: row.metadata, createdAt: row.created_at })),
-      usage_events: usageEvents.rows.map((row) => ({ id: row.id, project_id: row.project_id, user_id: row.user_id, api_key_id: row.api_key_id, product: row.product, action: row.action, credits: row.credits, status: row.status, metadata: row.metadata, created_at: row.created_at })),
-      topups: topups.rows.map((row) => ({ id: row.id, projectId: row.project_id, credits: row.credits, amountUsd: Number(row.amount_usd), status: row.status, provider: row.provider, createdAt: row.created_at, updatedAt: row.updated_at })),
+      wallets: Object.fromEntries(wallets.rows.map((row) => [row.project_id, { id: row.id, projectId: row.project_id, balance: row.balance_credits, lifetimeCredits: row.lifetime_credits, lifetimeSpend: row.lifetime_spend, freeCreditsGranted: row.free_credits_granted, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) }])),
+      transactions: transactions.rows.map((row) => ({ id: row.id, walletId: row.wallet_id, type: row.type, creditsDelta: row.credits_delta, balanceAfter: row.balance_after, reference: row.reference, metadata: row.metadata, createdAt: iso(row.created_at) })),
+      usage_events: usageEvents.rows.map((row) => ({ id: row.id, project_id: row.project_id, user_id: row.user_id, api_key_id: row.api_key_id, product: row.product, action: row.action, credits: row.credits, status: row.status, metadata: row.metadata, created_at: iso(row.created_at) })),
+      topups: topups.rows.map((row) => ({ id: row.id, projectId: row.project_id, credits: row.credits, amountUsd: Number(row.amount_usd), status: row.status, provider: row.provider, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) })),
       profiles: Object.fromEntries(wallets.rows.map((row) => [row.project_id, { purchased_credits_balance: row.balance_credits, free_plan_credits_used: 0 }])),
       project_api_keys: [], regions: [], organizations: [], projects: [], environments: [], provisioning_tasks: [], provisioning_attempts: [], audit_events: [],
     }
@@ -208,6 +208,13 @@ function verifyPassword(password, encoded) {
 
 function hashApiKey(key) {
   return createHash('sha256').update(key).digest('hex')
+}
+
+function iso(value) {
+  if (value instanceof Date) return value.toISOString()
+  if (typeof value === 'string') return value
+  if (value && typeof value === 'object' && typeof value.toISOString === 'function') return value.toISOString()
+  return value
 }
 
 function normalizeStoredSecrets(db) {
@@ -916,7 +923,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (path === '/projects' && method === 'GET') {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const db = await loadDb()
-    const projects = (db.cloud_projects || []).map((p) => ({
+    const owned = (db.cloud_projects || []).filter((p) => p.ownerId === user.id)
+    const projects = owned.map((p) => ({
       id: p.id,
       name: p.name,
       slug: p.slug,
@@ -1448,7 +1456,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = await loadDb()
-    return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit), requestId))
+    return r(200, ok(db.transactions.filter(t => t.walletId === db.wallets[projectId]?.id).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))).slice(0, limit), requestId))
   }
 
   // GET /api/v1/cloud/usage/events
@@ -1457,7 +1465,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const projectId = query.projectId; const limit = Number(query.limit) || 50
     if (!projectId) return e(400, 'invalid_request', 'projectId is required')
     const db = await loadDb()
-    return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit), requestId))
+    return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, limit), requestId))
   }
 
   // POST /api/v1/cloud/billing/topup — Lemon Squeezy when configured
