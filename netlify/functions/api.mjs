@@ -408,19 +408,26 @@ async function chargeCredits(headers, product, action, credits, requestId, metad
   return { ok: true, userId, remaining: dc.balance, projectId: keyInfo.projectId, apiKeyId: keyInfo.keyId }
 }
 
-async function providerChat(messages, model) {
+async function providerChat(messages, model, opts = {}) {
   // All Tera traffic routes through Talocode's own API. The model call is made
   // by the Tera service (api.teraai.chat); this gateway authenticates, meters,
   // and forwards so no external provider key ever touches this function.
   const upstream = process.env.TERA_BASE_URL || 'https://api.teraai.chat'
   const token = process.env.TALOCODE_API_KEY || process.env.TERA_UPSTREAM_KEY || ''
+  const forwarded = { model: model || 'default', messages }
+  const passthroughKeys = ['temperature', 'max_tokens', 'top_p', 'top_k', 'response_format', 'tool_choice', 'stream']
+  for (const key of passthroughKeys) {
+    if (opts[key] !== undefined && opts[key] !== null) {
+      forwarded[key] = opts[key]
+    }
+  }
   const r = await fetch(`${upstream}/v1/tera/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ model: model || 'default', messages }),
+    body: JSON.stringify(forwarded),
   })
   if (!r.ok) {
     const text = await r.text().catch(() => '')
@@ -1832,7 +1839,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           return e(400, 'invalid_request', 'messages array required')
         }
         try {
-          const result = await providerChat(payload.messages, payload.model)
+          const result = await providerChat(payload.messages, payload.model, payload)
           if (result?.result?.choices) {
             return r(200, {
               id: result.id || requestId,
@@ -2252,7 +2259,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const messages = payload.messages
     if (!Array.isArray(messages) || !messages.length) return e(400, 'invalid_request', 'messages array required')
     try {
-      const result = await providerChat(messages, payload.model)
+      const result = await providerChat(messages, payload.model, payload)
       // Normalize OpenAI-ish shape
       if (result?.result?.choices) {
         return r(200, {
