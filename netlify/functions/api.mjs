@@ -916,7 +916,18 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (path === '/projects' && method === 'GET') {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const db = await loadDb()
-    return r(200, ok(db.projects, requestId))
+    const projects = (db.cloud_projects || []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      slug: p.slug,
+      ownerId: p.ownerId,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+      status: 'active',
+      description: '',
+      organizationId: 'org-talocode',
+    }))
+    return r(200, ok(projects.length ? projects : db.projects, requestId))
   }
 
   if (path === '/projects' && method === 'POST') {
@@ -941,7 +952,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   if (projSlug && !projRes && method === 'GET' && path === `/projects/${projSlug}`) {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const db = await loadDb()
-    const proj = db.projects.find(p => p.id === projSlug || p.slug === projSlug)
+    const cloud = (db.cloud_projects || []).find(p => p.id === projSlug || p.slug === projSlug)
+    const proj = cloud ? { id: cloud.id, name: cloud.name, slug: cloud.slug, createdAt: cloud.createdAt, updatedAt: cloud.updatedAt, status: 'active', description: '', organizationId: 'org-talocode', ownerId: cloud.ownerId } : db.projects.find(p => p.id === projSlug || p.slug === projSlug)
     if (!proj) return e(404, 'not_found', 'Project not found')
     const org = db.organizations.find(o => o.id === proj.organizationId)
     const envs = db.environments.filter(e => e.projectId === proj.id)
