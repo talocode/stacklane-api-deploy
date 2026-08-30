@@ -1574,17 +1574,19 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const raw = typeof body === 'string' ? body : JSON.stringify(body || {})
     const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET
     const sig = headers['x-signature'] || headers['X-Signature']
-    if (secret && sig) {
-      const digest = createHmac('sha256', secret).update(raw).digest('hex')
-      try {
-        const a = Buffer.from(digest)
-        const b = Buffer.from(String(sig))
-        if (a.length !== b.length || !timingSafeEqual(a, b)) {
-          return e(400, 'invalid_signature', 'Invalid Lemon Squeezy webhook signature')
-        }
-      } catch {
+    if (!secret) {
+      return e(503, 'webhook_not_configured', 'Lemon Squeezy webhook secret is not configured.')
+    }
+    if (!sig) return e(400, 'missing_signature', 'X-Signature header is required.')
+    const digest = createHmac('sha256', secret).update(raw).digest('hex')
+    try {
+      const a = Buffer.from(digest)
+      const b = Buffer.from(String(sig))
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
         return e(400, 'invalid_signature', 'Invalid Lemon Squeezy webhook signature')
       }
+    } catch {
+      return e(400, 'invalid_signature', 'Invalid Lemon Squeezy webhook signature')
     }
     let event
     try { event = typeof body === 'string' ? JSON.parse(body) : body } catch {
@@ -1599,7 +1601,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (!topupId) return r(200, ok({ ignored: true, reason: 'no_topup_id' }, requestId))
     const db = ensureCloudShape(await loadDb())
     const topup = db.topups.find((t) => t.id === topupId)
-    if (!topup || topup.status === 'succeeded') {
+    const alreadyCredited = db.transactions.some((tx) => tx.type === 'topup' && tx.reference === topupId)
+    if (!topup || topup.status === 'succeeded' || alreadyCredited) {
       return r(200, ok({ already: true }, requestId))
     }
     const wallet = db.wallets[topup.projectId]
