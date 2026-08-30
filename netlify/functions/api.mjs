@@ -402,48 +402,28 @@ async function chargeCredits(headers, product, action, credits, requestId, metad
 }
 
 async function providerChat(messages, model) {
-  // Prefer Mistral when configured; otherwise deterministic mock for smoke tests
-  const mistral = process.env.MISTRAL_API_KEY
-  if (mistral) {
-    const r = await fetch('https://api.mistral.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${mistral}` },
-      body: JSON.stringify({
-        model: model || process.env.TERA_API_MODEL || 'mistral-small-latest',
-        messages,
-        temperature: 0.3,
-        max_tokens: 2000,
-      }),
-    })
-    if (!r.ok) throw new Error(`provider ${r.status}`)
-    return await r.json()
+  // All Tera traffic routes through Talocode's own API. The model call is made
+  // by the Tera service (api.teraai.chat); this gateway authenticates, meters,
+  // and forwards so no external provider key ever touches this function.
+  const upstream = process.env.TERA_BASE_URL || 'https://api.teraai.chat'
+  const token = process.env.TALOCODE_API_KEY || process.env.TERA_UPSTREAM_KEY || ''
+  const r = await fetch(`${upstream}/v1/tera/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ model: model || 'default', messages }),
+  })
+  if (!r.ok) {
+    const text = await r.text().catch(() => '')
+    throw new Error(`Tera upstream ${r.status} ${text.slice(0, 200)}`)
   }
-  // Proxy to live Tera API (accepts any bearer and mocks without MISTRAL)
-  try {
-    const r = await fetch('https://api.teraai.chat/v1/tera/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.TERA_UPSTREAM_KEY || ''}`,
-      },
-      body: JSON.stringify({ model: model || 'default', messages }),
-    })
-    const text = await r.text()
-    try { return JSON.parse(text) } catch { return { raw: text, status: r.status } }
-  } catch (err) {
-    const last = messages?.[messages.length - 1]?.content || ''
-    return {
-      id: 'mock_chat',
-      object: 'chat.completion',
-      model: model || 'mock',
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: `ScreenLane cloud mock: received ${String(last).slice(0, 200)}` },
-        finish_reason: 'stop',
-      }],
-      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
-    }
-  }
+  const json = await r.json().catch(() => null)
+  if (!json) throw new Error('Tera upstream returned non-JSON')
+  // Normalize to one shape: { result: { choices, usage } } or { choices, usage }
+  if (json.choices && !json.result) return json
+  return json
 }
 
 function extractSession(headers) {
