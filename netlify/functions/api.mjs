@@ -351,6 +351,49 @@ async function requireApiKey(headers) {
   return { ok: false, status: 401, code: 'invalid_api_key', message: 'Invalid API key' }
 }
 
+async function findKeyEntry(db, key) {
+  const userId = db.api_keys[`sha256:${hashApiKey(key)}`]
+  const entry = (db.cloud_api_keys || []).find((k) => k.keyHash === hashApiKey(key)) ||
+    (db.cloud_api_keys || []).find((k) => `sha256:${k.keyHash}` === `sha256:${hashApiKey(key)}`)
+  const project = entry && (db.cloud_projects || []).find((p) => p.id === entry.projectId)
+  return { userId, keyId: entry?.id || null, projectId: project?.id || null }
+}
+
+// Shared credit-charging + usage-metering primitive. Authenticates, debits the
+// user's wallet, records a usage_event (with project_id + api_key_id), and
+// persists. Every metered product endpoint should call this so all usage shows
+// up on dashboard.talocode.site/usage. Returns raw result; the caller builds the
+// HTTP response (use chargeResponse to map errors).
+async function chargeCredits(headers, product, action, credits, requestId, metadata) {
+  const auth = await requireApiKey(headers)
+  if (!auth.ok) return { ok: false, status: auth.status, code: auth.code, message: auth.message }
+  const db = await loadDb()
+  const keyInfo = await findKeyEntry(db, auth.key)
+  const userId = keyInfo.userId || auth.userId || 'user-admin-001'
+  const dc = debitCredits(db, userId, credits, product, action, requestId)
+  if (!dc.ok) {
+    return { ok: false, status: 402, code: 'insufficient_credits', message: `Insufficient credits. Required: ${dc.required}, Balance: ${dc.balance}`, required: dc.required, balance: dc.balance }
+  }
+  const wallet = resolveWallet(db, userId)
+  if (wallet) {
+    wallet.lifetimeSpend = (wallet.lifetimeSpend || 0) + credits
+  }
+  db.usage_events.push({
+    user_id: userId,
+    project_id: keyInfo.projectId || wallet?.projectId || null,
+    api_key_id: keyInfo.keyId || null,
+    product,
+    action,
+    credits,
+    status: 'charged',
+    metadata: metadata || {},
+    created_at: new Date().toISOString(),
+    request_id: requestId,
+  })
+  await saveDb(db)
+  return { ok: true, userId, remaining: dc.balance, projectId: keyInfo.projectId, apiKeyId: keyInfo.keyId }
+}
+
 async function providerChat(messages, model) {
   // Prefer Mistral when configured; otherwise deterministic mock for smoke tests
   const mistral = process.env.MISTRAL_API_KEY
@@ -1798,10 +1841,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (teraCaps) {
       return r(200, ok({ capabilities: [{ id: 'chat.completions', name: 'Chat Completions', credits: 3 }, { id: 'writing.rewrite', name: 'Rewrite Text', credits: 5 }, { id: 'writing.draft', name: 'Draft Content', credits: 10 }, { id: 'coding.explain', name: 'Explain Code', credits: 10 }, { id: 'coding.review', name: 'Review Code', credits: 20 }, { id: 'coding.write', name: 'Write Code', credits: 20 }] }, requestId))
     }
-    // POST endpoints → require TALOCODE_API_KEY, then provider/proxy
+    // POST endpoints → require TALOCODE_API_KEY + charge credits, then provider/proxy
     if (method === 'POST' && (sub === '/chat/completions' || sub === '/writing/rewrite' || sub === '/writing/draft' || sub === '/coding/explain' || sub === '/coding/review' || sub === '/coding/write')) {
-      const auth = await requireApiKey(headers)
-      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const teraCredits = sub === '/writing/draft' || sub === '/coding/explain' ? 10 : sub === '/coding/review' || sub === '/coding/write' ? 20 : sub === '/writing/rewrite' ? 5 : 3
+      const action = sub.replace(/^\//, '')
+      const charged = await chargeCredits(headers, 'tera_api', `tera.${action}`, teraCredits, requestId)
+      if (!charged.ok) return e(charged.status, charged.code, charged.message)
       const payload = jsonBody(body)
       if (!payload) return e(400, 'invalid_request', 'Request body is required')
       if (sub === '/chat/completions') {
@@ -1863,9 +1908,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       return r(200, ok({ 'generate.github-profile': 80, 'generate.github-repo': 100, 'generate.docs': 100, 'generate.text': 40, 'export.cursor': 10, 'export.claude': 10 }, requestId))
     }
     if (method === 'POST' && (sub.startsWith('/generate/') || sub.startsWith('/export/'))) {
+      const skillCredits = sub.includes('github-profile') ? 80 : sub.includes('github-repo') ? 100 : sub.includes('docs') ? 100 : sub.includes('text') ? 40 : sub.includes('export') ? 10 : 0
+      const charged = await chargeCredits(headers, 'skills', `skills.${sub.replace(/^\//, '')}`, skillCredits, requestId)
+      if (!charged.ok) return e(charged.status, charged.code, charged.message)
       const payload = jsonBody(body)
       if (!payload) return e(400, 'invalid_request', 'Request body is required')
-      return r(200, ok({ status: 'generated', skill: { name: payload.input || 'custom-skill', format: sub.includes('export') ? sub.split('/').pop() : 'SKILL.md', compatibleWith: ['Cursor', 'Claude Code', 'OpenCode', 'Codra'], credits: sub.includes('github-profile') ? 80 : sub.includes('github-repo') ? 100 : sub.includes('docs') ? 100 : sub.includes('text') ? 40 : sub.includes('export') ? 10 : 0 }, message: 'Skill generation is live when Talocode Cloud AI backends are connected. This endpoint is defined and ready.' }, requestId))
+      return r(200, ok({ status: 'generated', skill: { name: payload.input || 'custom-skill', format: sub.includes('export') ? sub.split('/').pop() : 'SKILL.md', compatibleWith: ['Cursor', 'Claude Code', 'OpenCode', 'Codra'], credits: skillCredits }, message: 'Skill generation is live when Talocode Cloud AI backends are connected. This endpoint is defined and ready.' }, requestId))
     }
   }
 
@@ -1897,8 +1945,6 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       return r(200, { ...getSearchLaneCapabilities(), meta: { requestId } })
     }
     if (method === 'POST' && (sub === '/query' || sub === '/news' || sub === '/research')) {
-      const auth = await requireApiKey(headers)
-      if (!auth.ok) return e(auth.status, auth.code, auth.message)
       const payload = jsonBody(body) || {}
       const query = typeof payload.query === 'string' ? payload.query.trim()
         : typeof payload.q === 'string' ? payload.q.trim() : ''
@@ -1909,25 +1955,18 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       const credits = creditMap[sub]
       const action = actionMap[sub]
       // Charge credits via wallet (single source of truth)
+      const charged = await chargeCredits(headers, 'searchlane', action, credits, requestId, { query, limit })
+      if (!charged.ok) {
+        return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: charged.remaining, meta: { requestId } })
+      }
       try {
-        const db = await loadDb()
-        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const dc = debitCredits(db, userId, credits, 'searchlane', action, requestId)
-        if (!dc.ok) {
-          return r(402, { ok: false, error: 'insufficient_credits', required: credits, available: dc.balance, meta: { requestId } })
-        }
-        db.usage_events.push({
-          user_id: userId, product: 'searchlane', action, credits,
-          metadata: { query, limit }, created_at: new Date().toISOString(), request_id: requestId,
-        })
-        await saveDb(db)
         let result
         if (sub === '/query') result = await runSearchQuery(query, { limit })
         else if (sub === '/news') result = await runSearchNews(query, { limit })
         else result = await runResearch(query, { limit, fetchPages: payload.fetchPages !== false })
         return r(200, {
           ...result,
-          usage: { credits, action, remaining: dc.balance },
+          usage: { credits, action, remaining: charged.remaining },
           meta: { requestId },
         })
       } catch (err) {
@@ -2228,9 +2267,9 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
   // OpenAI-compatible chat + router
-  if (method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/router/chat/completions' || path === '/v1/tera/chat/completions')) {
-    const auth = await requireApiKey(headers)
-    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+  if (method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/router/chat/completions')) {
+    const charged = await chargeCredits(headers, 'talocode-cloud', `router.${path === '/v1/router/chat/completions' ? 'chat' : 'chat'}`, 3, requestId)
+    if (!charged.ok) return e(charged.status, charged.code, charged.message)
     const payload = jsonBody(body) || {}
     const messages = payload.messages
     if (!Array.isArray(messages) || !messages.length) return e(400, 'invalid_request', 'messages array required')
@@ -2243,7 +2282,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           object: 'chat.completion',
           choices: result.result.choices,
           usage: result.result.usage || result.usage,
-          meta: { requestId, source: 'talocode-cloud', keyUser: auth.userId },
+          meta: { requestId, source: 'talocode-cloud', keyUser: charged.userId },
         })
       }
       if (result?.choices) {
@@ -2278,8 +2317,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // Codra cloud actions
   if (method === 'POST' && (path === '/v1/codra/run' || path === '/v1/codra/repo-summary')) {
-    const auth = await requireApiKey(headers)
-    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const charged = await chargeCredits(headers, 'codra', path === '/v1/codra/repo-summary' ? 'codra.repo_summary' : 'codra.run', 20, requestId)
+    if (!charged.ok) return e(charged.status, charged.code, charged.message)
     const payload = jsonBody(body) || {}
     const prompt = payload.prompt || payload.text || ''
     if (!prompt) return e(400, 'invalid_request', 'prompt or text required')
@@ -2299,14 +2338,15 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   // GateLane call passthrough stub (policy-aware later)
   if (method === 'POST' && path === '/v1/gatelane/call') {
-    const auth = await requireApiKey(headers)
-    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const charged = await chargeCredits(headers, 'gatelane', 'gatelane.check', 2, requestId)
+    if (!charged.ok) return e(charged.status, charged.code, charged.message)
     const payload = jsonBody(body) || {}
     return r(200, ok({
       allowed: true,
       tool: payload.tool || 'screenlane.command',
       input: payload.input || {},
       message: 'GateLane accepted call (policy default allow for ScreenLane).',
+      usage: { credits: 2, action: 'gatelane.check', remaining: charged.remaining },
     }, requestId))
   }
 
@@ -2359,8 +2399,8 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
   }
 
   if (method === 'POST' && path === '/v1/screenlane/send') {
-    const auth = await requireApiKey(headers)
-    if (!auth.ok) return e(auth.status, auth.code, auth.message)
+    const charged = await chargeCredits(headers, 'screenlane', 'screenlane.send', 3, requestId)
+    if (!charged.ok) return e(charged.status, charged.code, charged.message)
     const payload = jsonBody(body) || {}
     const text = payload.text || payload.commandText || payload.prompt || ''
     if (!text) return e(400, 'invalid_request', 'text required')
@@ -2369,7 +2409,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       const result = await providerChat([
         { role: 'user', content: text },
       ])
-      return r(200, ok({ sent: true, result, target: payload.target || 'cloud' }, requestId))
+      return r(200, ok({ sent: true, result, target: payload.target || 'cloud', usage: { credits: 3, action: 'screenlane.send', remaining: charged.remaining } }, requestId))
     } catch (err) {
       return e(502, 'provider_error', err.message)
     }
@@ -2462,20 +2502,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (method === 'GET' && sub === '/pricing') return r(200, ok(getSpendCapsPricing(), requestId))
     if (method === 'GET' && sub === '/capabilities') return r(200, ok(getSpendCapsCapabilities(), requestId))
     if (method === 'POST' && sub === '/check') {
-      const auth = await requireApiKey(headers)
-      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const charged = await chargeCredits(headers, 'spendcaps', 'spendcaps.check', 1, requestId)
+      if (!charged.ok) return e(charged.status, charged.code, charged.message)
       try {
         const payload = jsonBody(body) || {}
-        const db = await loadDb()
-        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const wallet = resolveWallet(db, userId)
-        const balance = wallet ? (wallet.balance || 0) : (db.profiles[userId]?.purchased_credits_balance || 0)
-        const result = checkSpendCap({ ...payload, balanceCredits: payload.balanceCredits ?? balance })
-        if (result.allowed) {
-          db.usage_events.push({ user_id: userId, product: 'spendcaps', action: 'spendcaps.check', credits: 1, metadata: { action: payload.action || '' }, created_at: new Date().toISOString(), request_id: requestId })
-          await saveDb(db)
-        }
-        return r(200, ok({ ...result, usage: { credits: 1, action: 'spendcaps.check', remaining: balance } }, requestId))
+        const result = checkSpendCap({ ...payload, balanceCredits: payload.balanceCredits ?? charged.remaining })
+        return r(200, ok({ ...result, usage: { credits: 1, action: 'spendcaps.check', remaining: charged.remaining } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'check failed')
       }
@@ -2493,20 +2525,13 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (method === 'GET' && sub === '/pricing') return r(200, ok(getPolicyLanePricing(), requestId))
     if (method === 'GET' && sub === '/capabilities') return r(200, ok(getPolicyLaneCapabilities(), requestId))
     if (method === 'POST' && sub === '/check') {
-      const auth = await requireApiKey(headers)
-      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const charged = await chargeCredits(headers, 'policylane', 'policylane.check', 2, requestId)
+      if (!charged.ok) return e(charged.status, charged.code, charged.message)
       const payload = jsonBody(body)
       if (!payload || !payload.policy || !payload.action) return e(422, 'validation_error', 'action and policy are required.')
       try {
-        const db = await loadDb()
-        const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
-        const credits = 2
-        const dc = debitCredits(db, userId, credits, 'policylane', 'policylane.check', requestId)
-        if (!dc.ok) return r(402, { ok: false, error: 'insufficient_credits', required: dc.required, available: dc.balance, meta: { requestId } })
         const result = checkPolicy(payload)
-        db.usage_events.push({ user_id: userId, product: 'policylane', action: 'policylane.check', credits, metadata: { action: payload.action }, created_at: new Date().toISOString(), request_id: requestId })
-        await saveDb(db)
-        return r(200, ok({ ...result, usage: { credits, action: 'policylane.check', remaining: dc.balance } }, requestId))
+        return r(200, ok({ ...result, usage: { credits: 2, action: 'policylane.check', remaining: charged.remaining } }, requestId))
       } catch (err) {
         return e(422, 'validation_error', err.message || 'check failed')
       }
@@ -2958,8 +2983,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       return r(200, ok(getDataLaneCapabilities(), requestId))
     }
     if (method === 'POST' && (path === '/v1/datalane/analyze' || path === '/v1/datalane/render')) {
-      const auth = await requireApiKey(headers)
-      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const isRenderPre = path.endsWith('/render')
+      const creditsPre = isRenderPre ? 1 : 5
+      const charged = await chargeCredits(headers, 'datalane', isRenderPre ? 'datalane.render' : 'datalane.analyze', creditsPre, requestId)
+      if (!charged.ok) return e(charged.status, charged.code, charged.message)
       const payload = jsonBody(body)
       if (!payload) return e(400, 'invalid_request', 'Request body is required')
 
