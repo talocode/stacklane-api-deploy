@@ -7,6 +7,9 @@
   node_bundler = "esbuild"
 external_node_modules = ["@netlify/blobs"]
 
+[functions.api]
+  maxDuration = 26
+
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/api/:splat"

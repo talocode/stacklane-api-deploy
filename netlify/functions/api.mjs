@@ -220,6 +220,72 @@ async function saveDb(db) {
   } finally { client.release() }
 }
 
+// Targeted persistence for metered (chargeCredits) writes. The generic saveDb
+// rewrites the entire control-plane DB (DELETE + INSERT of every table), which
+// exceeds the Netlify function time limit when a metered product (e.g. Tera
+// chat) calls it on every request. This writer persists only the rows that a
+// charge actually changed: the debited wallet, its usage transaction, and the
+// usage event. Everything else stays untouched in Postgres.
+async function persistCharge(db, keyInfo, userId, requestId) {
+  const wallet = resolveWallet(db, userId)
+  const event = (db.usage_events || []).find((e) => e.request_id === requestId)
+  const client = await getPool().connect()
+  try {
+    await client.query('BEGIN')
+    if (wallet && wallet.projectId) {
+      await client.query(
+        `UPDATE stacklane.wallets
+         SET balance_credits = $1, lifetime_credits = $2, lifetime_spend = $3,
+             free_credits_granted = $4, updated_at = $5
+         WHERE project_id = $6`,
+        [
+          wallet.balance || 0,
+          wallet.lifetimeCredits || 0,
+          wallet.lifetimeSpend || 0,
+          !!wallet.freeCreditsGranted,
+          new Date().toISOString(),
+          wallet.projectId,
+        ],
+      )
+      const tx = (db.transactions || []).find((t) => t.type === 'usage' && t.reference === requestId)
+        || (db.transactions || []).filter((t) => t.type === 'usage' && t.walletId === wallet.id).pop()
+      if (tx) {
+        await client.query(
+          `INSERT INTO stacklane.transactions
+            (id, wallet_id, type, credits_delta, balance_after, reference, metadata, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [tx.id, tx.walletId, tx.type, tx.creditsDelta, tx.balanceAfter, tx.reference, tx.metadata || {}, tx.createdAt || new Date().toISOString()],
+        )
+      }
+    }
+    if (event) {
+      await client.query(
+        `INSERT INTO stacklane.usage_events
+          (id, project_id, user_id, api_key_id, product, action, credits, status, metadata, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          event.id || makeId('ue'),
+          event.project_id || keyInfo?.projectId || null,
+          event.user_id || userId,
+          event.api_key_id || keyInfo?.keyId || null,
+          event.product,
+          event.action,
+          event.credits,
+          event.status || 'charged',
+          event.metadata || {},
+          event.created_at || new Date().toISOString(),
+        ],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
 function makeToken() {
   return randomBytes(32).toString('hex')
 }
@@ -404,7 +470,7 @@ async function chargeCredits(headers, product, action, credits, requestId, metad
     created_at: new Date().toISOString(),
     request_id: requestId,
   })
-  await saveDb(db)
+  await persistCharge(db, keyInfo, userId, requestId)
   return { ok: true, userId, remaining: dc.balance, projectId: keyInfo.projectId, apiKeyId: keyInfo.keyId }
 }
 
