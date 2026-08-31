@@ -286,6 +286,42 @@ async function persistCharge(db, keyInfo, userId, requestId) {
   }
 }
 
+// Targeted persistence for auth/session writes (login, logout). Login used the
+// generic saveDb, which rewrites the entire control-plane DB (DELETE + INSERT of
+// every table) on each sign-in -- slow and a reliability risk on the login path.
+// This writer persists only the session rows and the affected user's last_login_at.
+async function persistSession(db) {
+  const client = await getPool().connect()
+  try {
+    await client.query('BEGIN')
+    if (db.sessions) {
+      for (const [tokenHash, session] of Object.entries(db.sessions)) {
+        await client.query(
+          `INSERT INTO stacklane.sessions (token_hash, user_id, expires_at, created_at)
+           VALUES ($1, $2, now() + interval '7 days', $3)
+           ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+          [tokenHash, session.userId, session.createdAt || new Date().toISOString()],
+        )
+      }
+    }
+    if (db.users && (db.users || []).some((u) => u.lastLoginAt)) {
+      await client.query(
+        `UPDATE stacklane.users
+         SET last_login_at = COALESCE(u.last_login_at, users.last_login_at)
+         FROM jsonb_to_recordset($1::jsonb) AS u(id text, last_login_at timestamptz)
+         WHERE users.id = u.id AND u.last_login_at > users.last_login_at`,
+        [JSON.stringify(db.users.filter((u) => u.lastLoginAt).map((u) => ({ id: u.id, last_login_at: u.lastLoginAt })))],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
 function makeToken() {
   return randomBytes(32).toString('hex')
 }
@@ -854,7 +890,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const token = makeToken()
     db.sessions[hashApiKey(token)] = { userId: user.id, createdAt: new Date().toISOString() }
     user.lastLoginAt = new Date().toISOString()
-    await saveDb(db)
+    await persistSession(db)
     return withCors({
       statusCode: 200,
       headers: {
@@ -868,7 +904,16 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   if (method === 'POST' && path === '/auth/logout') {
     const token = extractSession(headers)
-    if (token) { const db = await loadDb(); delete db.sessions[hashApiKey(token)]; await saveDb(db) }
+    if (token) {
+      const db = await loadDb()
+      const tokenHash = hashApiKey(token)
+      delete db.sessions[tokenHash]
+      try {
+        const client = await getPool().connect()
+        try { await client.query('DELETE FROM stacklane.sessions WHERE token_hash = $1', [tokenHash]) } finally { client.release() }
+      } catch (error) { console.error('[auth] logout delete failed', error instanceof Error ? error.message : error) }
+      await persistSession(db)
+    }
     return withCors({
       statusCode: 200,
       headers: {
