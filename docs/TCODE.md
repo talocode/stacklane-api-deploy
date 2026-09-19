@@ -2,7 +2,24 @@
 
 Signed Solana wallet link plus monthly API credit claims. Credits are Talocode Cloud usage credits (1 credit = $0.01 list), not cash.
 
-## Live contract
+Public token page: https://talocode.site/tcode.html
+
+## Token
+
+| Field | Value |
+| --- | --- |
+| Name | Talocode |
+| Symbol | TCODE |
+| Chain | Solana mainnet |
+| Mint | `6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory` |
+| Decimals | 6 |
+| Total / max supply | 500,000 (mint revoked, freeze revoked) |
+
+Only this mint is $TCODE.
+
+Circulating supply equals tokens already in wallets. Until the launch curve completes, most of the 500,000 supply is not in an open pool.
+
+## Live API
 
 - `GET /api/v1/cloud/tcode` — mint and tiers (public)
 - `POST /api/v1/cloud/tcode/challenge` — session, `{ projectId }`
@@ -22,6 +39,10 @@ Client `rawBalance` is rejected. Holdings are read from `SOLANA_RPC_URL` (defaul
 | 5,000 | 500,000 |
 
 One Solana address maps to one Talocode project. One grant per project wallet per UTC month.
+
+## Not live
+
+Contributor airdrops, a redemption floor, and staking-for-product-perks are not implemented on this API.
 
 ## Env
 
