@@ -188,14 +188,17 @@ async function loadDb() {
 async function saveDb(db) {
   dbCache = db
   await ensurePostgres()
+  // Merge must run before a client is checked out: the pool is capped at one
+  // connection, so calling it inside the transaction below would wait forever
+  // for a free client and hang the request.
+  try {
+    await getTcodeStore().mergeSqlWalletsIntoCache(db)
+  } catch (error) {
+    console.error('[tcode] merge wallets failed', error instanceof Error ? error.message : error)
+  }
   const client = await getPool().connect()
   try {
     await client.query('BEGIN')
-    try {
-      await getTcodeStore().mergeSqlWalletsIntoCache(db)
-    } catch (error) {
-      console.error('[tcode] merge wallets failed', error instanceof Error ? error.message : error)
-    }
     await client.query('DELETE FROM stacklane.sessions')
     await client.query('DELETE FROM stacklane.usage_events')
     await client.query('DELETE FROM stacklane.transactions')
@@ -313,6 +316,39 @@ async function persistSession(db) {
         [JSON.stringify(db.users.filter((u) => u.lastLoginAt).map((u) => ({ id: u.id, last_login_at: u.lastLoginAt })))],
       )
     }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+// Targeted persistence for account creation. Register used the generic saveDb,
+// which rewrites the entire control-plane DB (DELETE + INSERT of every table)
+// and, inside that transaction, calls mergeSqlWalletsIntoCache while holding the
+// pool's only client -- so the merge waits forever for a free connection and the
+// request hangs until Netlify's inactivity timeout (the browser surfaces that as
+// "Cannot reach API"). This writer persists only the new user row and its session.
+async function persistRegister(user, tokenHash) {
+  const client = await getPool().connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `INSERT INTO stacklane.users (id, email, name, password_hash, status, last_login_at, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name,
+         password_hash = EXCLUDED.password_hash, status = EXCLUDED.status,
+         last_login_at = EXCLUDED.last_login_at, updated_at = EXCLUDED.updated_at`,
+      [user.id, user.email, user.name, user.passwordHash, user.status || 'active', user.lastLoginAt, user.createdAt, user.updatedAt],
+    )
+    await client.query(
+      `INSERT INTO stacklane.sessions (token_hash, user_id, expires_at, created_at)
+       VALUES ($1, $2, now() + interval '7 days', $3)
+       ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+      [tokenHash, user.id, user.createdAt || new Date().toISOString()],
+    )
     await client.query('COMMIT')
   } catch (error) {
     await client.query('ROLLBACK')
@@ -868,7 +904,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     db.profiles[user.id] = { purchased_credits_balance: 0, free_plan_credits_used: 0 }
     const token = makeToken()
     db.sessions[hashApiKey(token)] = { userId: user.id, createdAt: now }
-    await saveDb(db)
+    await persistRegister(user, hashApiKey(token))
     return withCors({
       statusCode: 201,
       headers: {
