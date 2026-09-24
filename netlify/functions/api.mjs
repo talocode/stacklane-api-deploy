@@ -1,7 +1,8 @@
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto'
 import fs from 'node:fs'
 import pg from 'pg'
-import { createTcodeStore, publicConfig as tcodePublicConfig, TcodeError, TCODE_SCHEMA_SQL } from './tcode.mjs'
+import { createTcodeStore, publicConfig as tcodePublicConfig, TcodeError, TCODE_SCHEMA_SQL, TCODE_MINT, fetchTcodeUsdPrice } from './tcode.mjs'
+import { CREDITS_PER_USD, getCreditPack, lemonSqueezyVariantFor, fiatCheckoutConfigured } from './credit-packs.mjs'
 
 const DB_PATH = '/tmp/stacklane-db.json'
 const BLOB_STORE = 'stacklane-cloud'
@@ -1620,15 +1621,62 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     return r(200, ok(db.usage_events.filter(e => e.user_id === user.id).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, limit), requestId))
   }
 
+  // GET /api/v1/cloud/billing/packs
+  // Both rails, one catalog. States plainly which method can complete for each
+  // pack, so a client never shows an option that cannot finish.
+  if (method === 'GET' && path === '/api/v1/cloud/billing/packs') {
+    const fiatReady = fiatCheckoutConfigured()
+    let options
+    try {
+      options = await getTcodeStore().listPaymentOptions()
+    } catch (err) {
+      console.error('[billing] packs unavailable:', err instanceof Error ? err.message : err)
+      options = { creditsPerUsd: CREDITS_PER_USD, tcode: { available: false, reason: 'unavailable' }, packs: [] }
+    }
+    const packs = options.packs.map(({ tcode, ...pack }) => {
+      const cardAvailable = Boolean(fiatReady && lemonSqueezyVariantFor(pack.id))
+      return {
+        ...pack,
+        methods: {
+          card: cardAvailable
+            ? { available: true, provider: 'lemonsqueezy', amountUsd: pack.amountUsd }
+            : {
+                available: false,
+                reason: fiatReady ? 'variant_not_configured' : 'checkout_not_configured',
+              },
+          tcode,
+        },
+      }
+    })
+    return r(200, ok({
+      creditsPerUsd: options.creditsPerUsd,
+      treasuryAddress: options.treasuryAddress || null,
+      tcode: options.tcode,
+      packs,
+    }, requestId))
+  }
+
   // POST /api/v1/cloud/billing/topup — Lemon Squeezy when configured
   if (method === 'POST' && path === '/api/v1/cloud/billing/topup') {
     const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
     const payload = jsonBody(body)
     if (!payload || !payload.projectId) return e(400, 'invalid_request', 'projectId is required')
-    const rawAmount = Number(payload.amount ?? payload.amountUsd ?? 0)
-    // amount >= 100 treated as credits
-    const credits = rawAmount >= 100 ? Math.floor(rawAmount) : Math.floor(rawAmount * 100)
-    const amountUsd = credits / 100
+    // Preferred: a server-owned packId, so credits never come from the request.
+    // A legacy `amount` is still accepted for existing clients but is
+    // deprecated and must not be used by new code.
+    let credits
+    let packId = null
+    if (payload.packId != null) {
+      const pack = getCreditPack(payload.packId)
+      if (!pack) return e(422, 'invalid_pack', 'packId is not a supported credit pack')
+      credits = pack.credits
+      packId = pack.id
+    } else {
+      const rawAmount = Number(payload.amount ?? payload.amountUsd ?? 0)
+      // amount >= 100 treated as credits
+      credits = rawAmount >= 100 ? Math.floor(rawAmount) : Math.floor(rawAmount * 100)
+    }
+    const amountUsd = credits / CREDITS_PER_USD
     if (!Number.isFinite(credits) || credits < 500) {
       return e(422, 'minimum_topup', 'Minimum top-up is 500 credits ($5.00)')
     }
@@ -1641,7 +1689,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const now = new Date().toISOString()
     db.topups.push({
       id: topupId, projectId: payload.projectId, credits, amountUsd,
-      status: 'pending', provider: 'lemonsqueezy', createdAt: now,
+      packId, status: 'pending', provider: 'lemonsqueezy', createdAt: now,
     })
     await saveDb(db)
 
@@ -1679,7 +1727,9 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           },
           test_mode: process.env.LEMONSQUEEZY_TEST_MODE === 'true',
         }
-        if (!variantMap[String(credits)]) {
+        // Fixed packs never use custom pricing. Only the deprecated legacy
+        // amount path falls back to a custom price.
+        if (!packId && !variantMap[String(credits)]) {
           attributes.custom_price = Math.round(amountUsd * 100)
         }
         const lsRes = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
@@ -1712,12 +1762,12 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }
 
     return r(201, ok({
-      topup: { id: topupId, walletId: wallet.id, amount: credits, status: 'pending' },
+      topup: { id: topupId, walletId: wallet.id, amount: credits, packId, status: 'pending' },
       checkoutUrl,
       lemonsqueezy: checkoutUrl ? { checkoutUrl } : null,
       stripePublishableKey: null,
       clientSecret: null,
-      creditsPerDollar: 100,
+      creditsPerDollar: CREDITS_PER_USD,
     }, requestId))
   }
 
@@ -1913,6 +1963,105 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         balance: result.balance,
         wallet: result.wallet,
       }, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
+  }
+
+  // ─── $TCODE credit purchases (pay for credits in $TCODE)
+
+  // GET /api/v1/cloud/tcode/price — public, cached briefly upstream
+  if (method === 'GET' && path === '/api/v1/cloud/tcode/price') {
+    try {
+      const priced = await fetchTcodeUsdPrice()
+      return r(200, ok({
+        token: 'TCODE',
+        mint: TCODE_MINT,
+        usdPrice: priced.price,
+        source: priced.source,
+        asOf: priced.at,
+      }, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
+  }
+
+  // POST /api/v1/cloud/tcode/purchase/quote
+  // Credits come only from the server-owned pack. A caller may send a packId
+  // and nothing else.
+  if (method === 'POST' && path === '/api/v1/cloud/tcode/purchase/quote') {
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.projectId || !payload.packId) {
+      return e(400, 'invalid_request', 'projectId and packId are required')
+    }
+    if (payload.credits != null || payload.amount != null || payload.amountUsd != null) {
+      return e(400, 'invalid_request', 'Credits are set by the pack, not by the request')
+    }
+    const owned = await requireOwnedCloudProject(payload.projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const quote = await getTcodeStore().createPurchaseQuote({
+        projectId: payload.projectId,
+        packId: payload.packId,
+      })
+      return r(201, ok(quote, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
+  }
+
+  // POST /api/v1/cloud/tcode/purchase
+  // Verifies the on-chain payment and credits once. The transaction signature
+  // is the idempotency key, so a retry or replay credits nothing further.
+  if (method === 'POST' && path === '/api/v1/cloud/tcode/purchase') {
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body)
+    if (!payload || !payload.projectId || !payload.quoteId || !payload.signature) {
+      return e(400, 'invalid_request', 'projectId, quoteId and signature are required')
+    }
+    const owned = await requireOwnedCloudProject(payload.projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const result = await getTcodeStore().creditPurchase({
+        projectId: payload.projectId,
+        quoteId: payload.quoteId,
+        signature: String(payload.signature).trim(),
+      })
+      if (result.wallet) {
+        syncCacheWallet(owned.db, result.wallet)
+        if (Array.isArray(owned.db.transactions) && result.credits > 0) {
+          owned.db.transactions.push({
+            id: makeId('ctxn'),
+            walletId: result.wallet.id,
+            type: 'tcode_purchase',
+            creditsDelta: result.credits,
+            balanceAfter: result.balance,
+            product: null,
+            action: 'purchase',
+            reference: result.signature,
+            metadata: { quoteId: result.quoteId },
+            createdAt: new Date().toISOString(),
+          })
+        }
+      }
+      return r(200, ok(result, requestId))
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
+  }
+
+  // GET /api/v1/cloud/tcode/purchases
+  if (method === 'GET' && path === '/api/v1/cloud/tcode/purchases') {
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    const owned = await requireOwnedCloudProject(query.projectId)
+    if (owned.error) return owned.error
+    if (owned.project.ownerId !== user.id) return e(403, 'forbidden', 'Access denied')
+    try {
+      const purchases = await getTcodeStore().listPurchases(query.projectId)
+      return r(200, ok({ purchases }, requestId))
     } catch (error) {
       return tcodeFail(error, e, requestId)
     }
