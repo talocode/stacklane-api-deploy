@@ -338,6 +338,13 @@ async function fulfilTopup(topupId) {
       await client.query('COMMIT')
       return { state: 'already', credits: topup.credits }
     }
+    // A cancelled or failed top-up must never be credited. If a payment lands
+    // after it was cancelled, that is a conflict for a person to resolve, not
+    // something to pay out silently.
+    if (topup.status !== 'pending') {
+      await client.query('ROLLBACK')
+      return { state: 'refused', status: topup.status }
+    }
     const credited = await client.query(
       `UPDATE stacklane.wallets
           SET balance_credits = balance_credits + $2,
@@ -1901,6 +1908,10 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (fulfilled.state === 'no_wallet') {
       console.error('[billing] topup has no wallet', topupId)
       return e(409, 'no_wallet', `Top-up ${topupId} has no wallet`)
+    }
+    if (fulfilled.state === 'refused') {
+      console.error('[billing] refusing to credit a', fulfilled.status, 'topup', topupId)
+      return e(409, 'topup_not_pending', `Top-up ${topupId} is ${fulfilled.status}`)
     }
     return r(
       200,
