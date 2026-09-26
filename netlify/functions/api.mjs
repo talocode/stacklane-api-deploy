@@ -1946,6 +1946,214 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     }, requestId))
   }
 
+  // ─── Telegram account linking (mirrors the wallet challenge/link pair) ───
+  //
+  // The wallet flow proves control of an external identity by verifying a
+  // signature. Telegram has nothing to sign, so the proof is instead possession
+  // of a code that only the dashboard could have issued and only the bot can
+  // redeem. The bot authenticates with a shared secret, so the API never trusts
+  // a caller's word about which Telegram account is speaking.
+
+  function telegramSecretOk() {
+    const secret = process.env.TELEGRAM_LINK_SECRET
+    const provided = headers['x-telegram-link-secret'] || headers['X-Telegram-Link-Secret']
+    if (!secret || !provided) return false
+    const a = Buffer.from(String(secret))
+    const b = Buffer.from(String(provided))
+    return a.length === b.length && timingSafeEqual(a, b)
+  }
+
+  // No O/0 or I/1. This code is read off a screen and typed into a chat, and a
+  // lookalike character should not be the reason a link fails.
+  function newLinkCode() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    const bytes = randomBytes(10)
+    let out = ''
+    for (let i = 0; i < 8; i += 1) out += alphabet[bytes[i] % alphabet.length]
+    return out
+  }
+
+  async function createTelegramChallenge(userId, purpose) {
+    const client = await getPool().connect()
+    try {
+      const res = await client.query(
+        `INSERT INTO stacklane.telegram_challenges (code, user_id, purpose, expires_at)
+         VALUES ($1, $2, $3, now() + interval '10 minutes')
+         RETURNING code, purpose, expires_at`,
+        [newLinkCode(), userId, purpose],
+      )
+      return res.rows[0]
+    } finally {
+      client.release()
+    }
+  }
+
+  // Redeem a code exactly once. The UPDATE ... WHERE consumed_at IS NULL is the
+  // atomic claim: two simultaneous redemptions cannot both succeed, which is what
+  // stops a code being replayed into two different accounts.
+  async function consumeTelegramChallenge(code, telegram) {
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      const claimed = await client.query(
+        `UPDATE stacklane.telegram_challenges
+            SET consumed_at = now(), telegram_id = $2
+          WHERE code = $1 AND consumed_at IS NULL AND expires_at > now()
+          RETURNING user_id, purpose`,
+        [code, telegram.id],
+      )
+      const row = claimed.rows[0]
+      if (!row) {
+        await client.query('ROLLBACK')
+        return null
+      }
+      if (row.purpose === 'link') {
+        // Both directions are unique, so a re-link replaces: the same Telegram
+        // account moving to another dashboard user, or the same user reconnecting.
+        await client.query(
+          `DELETE FROM stacklane.telegram_links WHERE telegram_id = $1 OR user_id = $2`,
+          [telegram.id, row.user_id],
+        )
+        await client.query(
+          `INSERT INTO stacklane.telegram_links (telegram_id, user_id, username, first_name, linked_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, now(), now())`,
+          [telegram.id, row.user_id, telegram.username || null, telegram.firstName || null],
+        )
+      }
+      await client.query('COMMIT')
+      return { userId: row.user_id, purpose: row.purpose }
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  if (method === 'POST' && path === '/api/v1/cloud/telegram/challenge') {
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    try {
+      const challenge = await createTelegramChallenge(user.id, 'link')
+      return r(200, ok({
+        code: challenge.code,
+        expiresAt: iso(challenge.expires_at),
+        botUsername: 'workerlanebot',
+        instructions: `Send /connect ${challenge.code} to @workerlanebot. It expires in 10 minutes.`,
+      }, requestId))
+    } catch (error) {
+      console.error('[telegram] challenge failed', error instanceof Error ? error.message : error)
+      return e(500, 'challenge_failed', 'Could not create a link code.')
+    }
+  }
+
+  if (method === 'POST' && path === '/api/v1/cloud/telegram/claim') {
+    if (!telegramSecretOk()) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body) || {}
+    const telegramId = payload.telegramId != null ? String(payload.telegramId) : ''
+    const code = String(payload.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+    if (!telegramId || !code) return e(400, 'invalid_request', 'telegramId and code are required')
+    try {
+      const claimed = await consumeTelegramChallenge(code, {
+        id: telegramId,
+        username: payload.username,
+        firstName: payload.firstName,
+      })
+      if (!claimed) return e(404, 'invalid_code', 'That code is not valid, has expired, or has already been used.')
+      return r(200, ok({ linked: claimed.purpose === 'link', purpose: claimed.purpose, userId: claimed.userId }, requestId))
+    } catch (error) {
+      console.error('[telegram] claim failed', error instanceof Error ? error.message : error)
+      return e(500, 'claim_failed', 'Could not link that account.')
+    }
+  }
+
+  if (method === 'GET' && path === '/api/v1/cloud/telegram/status') {
+    const user = await requireAuth(); if (!user) return e(401, 'not_authenticated', 'Not authenticated')
+    try {
+      const found = await getPool().query(
+        `SELECT telegram_id, username, first_name, linked_at FROM stacklane.telegram_links WHERE user_id = $1`,
+        [user.id],
+      )
+      const row = found.rows[0]
+      return r(200, ok(row
+        ? { linked: true, telegramId: row.telegram_id, username: row.username, firstName: row.first_name, linkedAt: iso(row.linked_at) }
+        : { linked: false }, requestId))
+    } catch (error) {
+      console.error('[telegram] status failed', error instanceof Error ? error.message : error)
+      return e(500, 'status_failed', 'Could not read the link state.')
+    }
+  }
+
+  // Signing in the other way round: the bot asks for a one-time code on behalf of
+  // a linked Telegram account, and the dashboard exchanges that code for a
+  // session. The session token itself is never sent through the chat.
+  if (method === 'POST' && path === '/api/v1/cloud/telegram/login') {
+    if (!telegramSecretOk()) return e(401, 'not_authenticated', 'Not authenticated')
+    const payload = jsonBody(body) || {}
+    const telegramId = payload.telegramId != null ? String(payload.telegramId) : ''
+    if (!telegramId) return e(400, 'invalid_request', 'telegramId is required')
+    try {
+      const link = await getPool().query(
+        `SELECT user_id FROM stacklane.telegram_links WHERE telegram_id = $1`,
+        [telegramId],
+      )
+      if (!link.rows[0]) return e(404, 'not_linked', 'That Telegram account is not linked to a Talocode account.')
+      const challenge = await createTelegramChallenge(link.rows[0].user_id, 'login')
+      return r(200, ok({
+        code: challenge.code,
+        expiresAt: iso(challenge.expires_at),
+        url: `https://dashboard.talocode.site/telegram?code=${challenge.code}`,
+      }, requestId))
+    } catch (error) {
+      console.error('[telegram] login challenge failed', error instanceof Error ? error.message : error)
+      return e(500, 'login_failed', 'Could not create a sign-in code.')
+    }
+  }
+
+  if (method === 'POST' && path === '/api/v1/cloud/telegram/session') {
+    const payload = jsonBody(body) || {}
+    const code = String(payload.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+    if (!code) return e(400, 'invalid_request', 'code is required')
+    try {
+      const claimed = await consumeTelegramChallenge(code, { id: null })
+      // Purpose is checked, not just validity: a link code must not be usable to
+      // obtain a session.
+      if (!claimed || claimed.purpose !== 'login') {
+        return e(404, 'invalid_code', 'That sign-in link is not valid, has expired, or has already been used.')
+      }
+      const token = makeToken()
+      const client = await getPool().connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(
+          `INSERT INTO stacklane.sessions (token_hash, user_id, expires_at, created_at)
+           VALUES ($1, $2, now() + interval '7 days', now())
+           ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+          [hashApiKey(token), claimed.userId],
+        )
+        await client.query(`UPDATE stacklane.users SET last_login_at = now() WHERE id = $1`, [claimed.userId])
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+      const user = await getPool().query(`SELECT id, email, name FROM stacklane.users WHERE id = $1`, [claimed.userId])
+      return withCors({
+        statusCode: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': `sl_session=${token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800`,
+          ...corsHeaders(origin),
+        },
+        body: JSON.stringify(ok({ user: user.rows[0] || null }, requestId)),
+      }, origin)
+    } catch (error) {
+      console.error('[telegram] session failed', error instanceof Error ? error.message : error)
+      return e(500, 'session_failed', 'Could not create a session.')
+    }
+  }
+
   // ─── $TCODE hold-to-earn (signed link + on-chain holdings + monthly claim)
   async function requireOwnedCloudProject(projectId) {
     if (!projectId) return { error: e(400, 'invalid_request', 'projectId is required') }
