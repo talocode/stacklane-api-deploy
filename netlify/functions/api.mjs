@@ -291,6 +291,87 @@ async function persistCharge(db, keyInfo, userId, requestId) {
   }
 }
 
+// Fulfil a purchased credit top-up exactly once.
+//
+// Two bugs made every top-up stay pending forever:
+//
+//  1. The handler read the top-up from dbCache. That cache is loaded once per
+//     instance and never refreshed, so a webhook arriving on an instance whose
+//     cache predates the purchase found no top-up and returned 200 {already:true}.
+//     Lemon Squeezy treats 200 as delivered, so it never retried, and the
+//     purchase sat pending with no error recorded anywhere.
+//  2. Crediting went through saveDb, which DELETEs every billing table and
+//     re-inserts them from that same stale cache. Two overlapping requests
+//     therefore overwrite each other, which is where the drifting balances and
+//     the ledger rows that do not reconcile come from.
+//
+// This reads the top-up from Postgres, locks the wallet row, credits it once,
+// writes the ledger entry and marks the top-up succeeded in a single
+// transaction. It never touches another table.
+async function fulfilTopup(topupId) {
+  const client = await getPool().connect()
+  try {
+    await client.query('BEGIN')
+    const found = await client.query(
+      `SELECT id, project_id, credits, status FROM stacklane.topups WHERE id = $1 FOR UPDATE`,
+      [topupId]
+    )
+    const topup = found.rows[0]
+    if (!topup) {
+      await client.query('ROLLBACK')
+      return { state: 'unknown' }
+    }
+    // The status alone is not enough: an earlier delivery may have credited the
+    // wallet and then failed before writing the status. The ledger is the
+    // authority on whether this top-up has already been paid out.
+    const ledger = await client.query(
+      `SELECT 1 FROM stacklane.transactions WHERE type = 'topup' AND reference = $1 LIMIT 1`,
+      [topupId]
+    )
+    if (topup.status === 'succeeded' || ledger.rowCount > 0) {
+      if (topup.status !== 'succeeded') {
+        await client.query(
+          `UPDATE stacklane.topups SET status = 'succeeded', updated_at = now() WHERE id = $1`,
+          [topupId]
+        )
+      }
+      await client.query('COMMIT')
+      return { state: 'already', credits: topup.credits }
+    }
+    const credited = await client.query(
+      `UPDATE stacklane.wallets
+          SET balance_credits = balance_credits + $2,
+              lifetime_credits = lifetime_credits + $2,
+              updated_at = now()
+        WHERE project_id = $1
+        RETURNING id, balance_credits`,
+      [topup.project_id, topup.credits]
+    )
+    if (credited.rowCount === 0) {
+      await client.query('ROLLBACK')
+      return { state: 'no_wallet' }
+    }
+    const wallet = credited.rows[0]
+    await client.query(
+      `INSERT INTO stacklane.transactions
+         (id, wallet_id, type, credits_delta, balance_after, reference, metadata, created_at)
+       VALUES ($1, $2, 'topup', $3, $4, $5, $6, now())`,
+      [makeId('ctxn'), wallet.id, topup.credits, wallet.balance_credits, topupId, { provider: 'lemonsqueezy' }]
+    )
+    await client.query(
+      `UPDATE stacklane.topups SET status = 'succeeded', updated_at = now() WHERE id = $1`,
+      [topupId]
+    )
+    await client.query('COMMIT')
+    return { state: 'credited', credits: topup.credits, balance: wallet.balance_credits }
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
 // Targeted persistence for auth/session writes (login, logout). Login used the
 // generic saveDb, which rewrites the entire control-plane DB (DELETE + INSERT of
 // every table) on each sign-in -- slow and a reliability risk on the login path.
@@ -1802,33 +1883,29 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     const custom = event?.meta?.custom_data || {}
     const topupId = custom.topup_id || custom.topupId
     if (!topupId) return r(200, ok({ ignored: true, reason: 'no_topup_id' }, requestId))
-    const db = ensureCloudShape(await loadDb())
-    const topup = db.topups.find((t) => t.id === topupId)
-    const alreadyCredited = db.transactions.some((tx) => tx.type === 'topup' && tx.reference === topupId)
-    if (!topup || topup.status === 'succeeded' || alreadyCredited) {
-      return r(200, ok({ already: true }, requestId))
+
+    let fulfilled
+    try {
+      fulfilled = await fulfilTopup(topupId)
+    } catch (error) {
+      console.error('[billing] topup fulfilment failed', topupId, error instanceof Error ? error.message : error)
+      return e(500, 'topup_failed', 'Could not apply this top-up.')
     }
-    const wallet = db.wallets[topup.projectId]
-    if (!wallet) return e(404, 'not_found', 'Wallet not found')
-    const now = new Date().toISOString()
-    wallet.balance = (wallet.balance || 0) + topup.credits
-    wallet.lifetimeCredits = (wallet.lifetimeCredits || 0) + topup.credits
-    wallet.updatedAt = now
-    topup.status = 'succeeded'
-    db.transactions.push({
-      id: makeId('ctxn'),
-      walletId: wallet.id,
-      type: 'topup',
-      creditsDelta: topup.credits,
-      balanceAfter: wallet.balance,
-      product: null,
-      action: 'topup',
-      reference: topupId,
-      metadata: { provider: 'lemonsqueezy' },
-      createdAt: now,
-    })
-    await saveDb(db)
-    return r(200, ok({ credited: true, topupId, credits: topup.credits }, requestId))
+    if (fulfilled.state === 'unknown') {
+      // Returning 200 here previously told Lemon Squeezy the delivery was
+      // handled, so it never retried and the purchase stayed pending forever.
+      // Fail loudly so the delivery is retried and the problem is visible.
+      console.error('[billing] webhook for unknown topup', topupId, 'event', name)
+      return e(404, 'unknown_topup', `No top-up matches ${topupId}`)
+    }
+    if (fulfilled.state === 'no_wallet') {
+      console.error('[billing] topup has no wallet', topupId)
+      return e(409, 'no_wallet', `Top-up ${topupId} has no wallet`)
+    }
+    return r(
+      200,
+      ok({ credited: fulfilled.state === 'credited', topupId, credits: fulfilled.credits }, requestId),
+    )
   }
 
   // POST /api/v1/cloud/billing/topup/confirm
