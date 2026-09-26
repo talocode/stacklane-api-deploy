@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import pg from 'pg'
 import { createTcodeStore, publicConfig as tcodePublicConfig, TcodeError, TCODE_SCHEMA_SQL, TCODE_MINT, fetchTcodeUsdPrice } from './tcode.mjs'
 import { CREDITS_PER_USD, getCreditPack, lemonSqueezyVariantFor, fiatCheckoutConfigured } from './credit-packs.mjs'
+import { dispatchTool, listAdvertisedTools, toolRegistrySummary } from './mcp-dispatch.mjs'
 
 const DB_PATH = '/tmp/stacklane-db.json'
 const BLOB_STORE = 'stacklane-cloud'
@@ -2452,14 +2453,17 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
     // GET /mcp - health / discovery
     if (method === 'GET') {
+      const summary = toolRegistrySummary(MCP_TOOLS)
       return mcpRpc(200, {
         ok: true,
         service: 'talocode-mcp',
-        version: '0.1.0',
+        version: '0.2.0',
         endpoint: '/mcp',
         transport: 'streamable-http',
         auth: 'TALOCODE_API_KEY',
-        tools: MCP_TOOLS.length,
+        tools: summary.advertised,
+        toolsDefined: summary.defined,
+        toolsHidden: summary.hidden,
       })
     }
 
@@ -2493,7 +2497,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
           jsonrpc: '2.0',
           id: rpcId,
           result: {
-            tools: MCP_TOOLS.map((t) => ({
+            tools: listAdvertisedTools(MCP_TOOLS).map((t) => ({
               name: t.name,
               description: t.description,
               inputSchema: { type: 'object', additionalProperties: true, properties: {} },
@@ -2515,15 +2519,36 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         }
         const name = payload.params && payload.params.name
         const args = (payload.params && payload.params.arguments) || {}
-        const tool = MCP_TOOLS.find((t) => t.name === name)
-        if (!tool) {
-          return mcpRpc(200, { jsonrpc: '2.0', id: rpcId, result: { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true } })
+
+        // Context for the in-process tools (credit balance, recent usage). An API
+        // key could spend credits but not read its own balance before this.
+        let keyContext = null
+        try {
+          const db = await loadDb()
+          const keyInfo = await findKeyEntry(db, auth.key)
+          const userId = keyInfo.userId || auth.userId
+          const usageEvents = (db.usage_events || []).filter(
+            (event) => (keyInfo.projectId && event.project_id === keyInfo.projectId) || event.user_id === userId,
+          )
+          keyContext = {
+            projectId: keyInfo.projectId || null,
+            userId,
+            wallet: resolveWallet(db, userId),
+            usageEvents,
+          }
+        } catch (err) {
+          console.error('[mcp] key context unavailable:', err instanceof Error ? err.message : err)
+          keyContext = null
         }
-        return mcpRpc(200, {
-          jsonrpc: '2.0',
-          id: rpcId,
-          result: { content: [{ type: 'text', text: `${name} is defined on api.talocode.site/mcp. Underlying product service wiring is being connected; arguments received: ${JSON.stringify(args)}` }], isError: false },
+
+        // Proxy the tool to the HTTP route that implements it. That reuses the
+        // route layer's API-key auth and credit charging instead of duplicating it.
+        const result = await dispatchTool(name, args, {
+          headers,
+          keyContext,
+          callRoute: (m, p, h, b, q) => routeHandler(m, p, h, b, q),
         })
+        return mcpRpc(200, { jsonrpc: '2.0', id: rpcId, result })
       }
 
       return mcpRpc(400, { jsonrpc: '2.0', error: { code: -32601, message: `Method not supported: ${rpcMethod}` }, id: rpcId })
