@@ -3053,7 +3053,7 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         const userId = auth.userId || db.api_keys[`sha256:${hashApiKey(auth.key)}`] || 'user-admin-001'
         const result = debitCredits(db, userId, credits, 'verifylane', action, requestId)
         if (!result.ok) return r(402, { ok: false, error: 'insufficient_credits', required: result.required, available: result.balance, meta: { requestId } })
-        const output = runner()
+        const output = await runner()
         db.usage_events.push({ user_id: userId, product: 'verifylane', action, credits, metadata: {}, created_at: new Date().toISOString(), request_id: requestId })
         await saveDb(db)
         return r(200, ok({ ...output, usage: { credits, action, remaining: result.balance } }, requestId))
@@ -3068,6 +3068,15 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
     if (method === 'POST' && sub === '/code') return runVerify('verifylane.code', 8, () => verifyCode(jsonBody(body)))
     if (method === 'POST' && sub === '/diff') return runVerify('verifylane.diff', 8, () => verifyDiff(jsonBody(body)))
     if (method === 'POST' && sub === '/agent-output') return runVerify('verifylane.agent-output', 5, () => verifyAgentOutput(jsonBody(body)))
+    if (method === 'POST' && sub === '/token') {
+      // Asynchronous, unlike the other verifylane checks: it reads market data
+      // rather than scanning text. runVerify now awaits the runner, which is what
+      // lets a networked check live behind the same debit and usage-event path.
+      return runVerify('verifylane.token', 5, async () => {
+        const { verifyTokenIdentity } = await import('./cmc.mjs')
+        return verifyTokenIdentity(jsonBody(body) || {})
+      })
+    }
     if (method === 'POST' && sub === '/email') {
       const payload = jsonBody(body) || {}
       const value = typeof payload.value === 'string' ? payload.value : ''

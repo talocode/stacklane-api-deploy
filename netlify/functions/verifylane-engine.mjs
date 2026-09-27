@@ -574,6 +574,7 @@ export function getVerifyLaneCapabilities() {
       'POST /v1/verifylane/code',
       'POST /v1/verifylane/diff',
       'POST /v1/verifylane/agent-output',
+      'POST /v1/verifylane/token',
       'POST /v1/verifylane/email',
       'POST /v1/verifylane/phone',
       'POST /v1/verifylane/ip',
