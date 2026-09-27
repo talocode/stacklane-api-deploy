@@ -1,4 +1,4 @@
-# Free single-file scan — post copy
+# Free single-file scan - post copy
 
 The offer is one file, scanned free. It is deliberately small: it costs minutes to
 fulfil, it needs no deploy, and it produces a real report the person can look at
