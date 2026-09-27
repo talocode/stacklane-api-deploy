@@ -176,16 +176,73 @@ test('an explicit plan message is reported as plan_unsupported', async () => {
   })
 })
 
-test('an address-only query says the lookup is unavailable rather than searching for the address text', async () => {
+test('a Solana address with no token source configured reports that, and never searches the address text', async () => {
+  await withKey(async () => {
+    const prior = process.env.JUPITER_API_KEY
+    delete process.env.JUPITER_API_KEY
+    try {
+      const seen = []
+      const result = await verifyTokenIdentity(
+        { address: '6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory' },
+        { fetchImpl: fakeFetch([ROW], seen) },
+      )
+      assert.equal(seen.length, 0, 'the keyword endpoint must not be used for an address')
+      assert.ok(result.findings.some((f) => f.rule === 'token.not_configured'))
+      assert.equal(result.ok, false)
+    } finally {
+      if (prior !== undefined) process.env.JUPITER_API_KEY = prior
+    }
+  })
+})
+
+test('a non-Solana address is refused plainly rather than searched for as text', async () => {
   await withKey(async () => {
     const seen = []
     const result = await verifyTokenIdentity(
-      { address: '6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory' },
+      { address: '0xfa05f0a4897eb89956ea66e3bc4b5df1bfdaf1ae' },
       { fetchImpl: fakeFetch([ROW], seen) },
     )
-    assert.equal(seen.length, 0, 'no upstream call should be made for an address-only query')
-    assert.ok(result.findings.some((f) => f.rule === 'token.address_lookup_unavailable'))
+    assert.equal(seen.length, 0)
+    assert.ok(result.findings.some((f) => f.rule === 'token.address_unsupported'))
     assert.equal(result.ok, false)
+  })
+})
+
+test('a Solana mint resolves through the token source and carries risk findings', async () => {
+  await withKey(async () => {
+    const prior = process.env.JUPITER_API_KEY
+    process.env.JUPITER_API_KEY = 'test-key'
+    try {
+      const deps = {
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              id: '6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory',
+              name: 'Example',
+              symbol: 'EXM',
+              holderCount: 5,
+              liquidity: 100,
+              audit: { mintAuthorityDisabled: false, freezeAuthorityDisabled: true, topHoldersPercentage: 80 },
+            },
+          ],
+        }),
+      }
+      const result = await verifyTokenIdentity(
+        { address: '6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory', expectedSymbol: 'OTHER' },
+        deps,
+      )
+      assert.equal(result.tokens.length, 1)
+      assert.equal(result.tokens[0].symbol, 'EXM')
+      assert.ok(result.findings.some((f) => f.rule === 'token.mint_authority_live' && f.severity === 'critical'))
+      assert.ok(result.findings.some((f) => f.rule === 'token.symbol_mismatch'))
+      assert.ok(result.findings.some((f) => f.rule === 'token.thin_liquidity'))
+      assert.equal(result.ok, false, 'a live mint authority must not produce an ok result')
+    } finally {
+      if (prior === undefined) delete process.env.JUPITER_API_KEY
+      else process.env.JUPITER_API_KEY = prior
+    }
   })
 })
 

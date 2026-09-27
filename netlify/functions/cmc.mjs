@@ -192,16 +192,70 @@ export async function verifyTokenIdentity(input = {}, deps = {}) {
       message: 'Market data is not configured on this deployment, so identity cannot be resolved.',
     })
   } else {
-    // A bare address is the question we cannot answer on this plan. Say that
-    // plainly instead of searching for the address text and returning noise.
-    if (address && !keyword) {
-      findings.push({
-        id: 'token.address_lookup_unavailable',
-        rule: 'token.address_lookup_unavailable',
-        severity: 'high',
-        message:
-          'Looking a token up by contract address needs a market-data plan that includes the DEX token endpoint. Supply a name or symbol instead, or upgrade the plan to verify an address directly.',
-      })
+    // Address lookup is delegated: the market-data provider gates the equivalent
+    // call, while the Solana source resolves a mint directly and returns audit
+    // flags rather than only identity. Since the tokens being checked are Solana
+    // tokens, this is the path that actually answers the question.
+    if (address) {
+      const { looksLikeSolanaMint, lookupTokenByMint, jupiterConfigured } = await import('./jupiter.mjs')
+      const { tokenFindings } = await import('./token-risk.mjs')
+      if (!looksLikeSolanaMint(address)) {
+        findings.push({
+          id: 'token.address_unsupported',
+          rule: 'token.address_unsupported',
+          severity: 'high',
+          message:
+            'Address lookup is only available for Solana mints on this deployment. Supply a name or symbol, or a Solana mint address.',
+        })
+      } else if (!jupiterConfigured()) {
+        findings.push({
+          id: 'token.not_configured',
+          rule: 'token.not_configured',
+          severity: 'high',
+          message: 'Solana token data is not configured on this deployment, so the mint cannot be resolved.',
+        })
+      } else {
+        try {
+          const lookup = await lookupTokenByMint(address, deps)
+          cached = lookup.cached
+          if (!lookup.found || !lookup.token) {
+            findings.push({
+              id: 'token.not_found',
+              rule: 'token.not_found',
+              severity: 'high',
+              message: 'That mint is not known to the source. It may be too new, or not a token at all.',
+            })
+          } else {
+            const t = lookup.token
+            tokens = [
+              {
+                name: t.name,
+                symbol: t.symbol,
+                platform: 'Solana',
+                address: t.address,
+                website: t.channels.website,
+                x: t.channels.twitter,
+                logo: t.icon,
+                priceUsd: t.priceUsd,
+                change24h: null,
+                decimals: t.decimals,
+              },
+            ]
+            findings.push(...tokenFindings(t, {
+              expectedSymbol: input.expectedSymbol,
+              expectedName: input.expectedName,
+            }))
+          }
+        } catch (err) {
+          upstreamError = err.code || 'upstream_error'
+          findings.push({
+            id: `token.${upstreamError}`,
+            rule: `token.${upstreamError}`,
+            severity: 'high',
+            message: `The token source could not answer right now: ${err.message}`,
+          })
+        }
+      }
     } else if (keyword) {
       try {
         const res = await lookupTokenIdentity({ keyword, network }, deps)
@@ -271,9 +325,10 @@ export async function verifyTokenIdentity(input = {}, deps = {}) {
     summary: summarize(findings),
     upstream: { cached, credits: upstreamCredits, error: upstreamError },
     limitations: [
-      'Keyword matching, not contract-address verification: that endpoint is not on this plan.',
-      'Presence in the feed is not a safety assertion about the token.',
+      'Address lookup covers Solana mints only. Other chains fall back to keyword matching.',
+      'Presence in a feed is not a safety assertion about the token.',
       'A matching name does not mean a matching contract. Compare the address before trusting it.',
+      'Risk thresholds are judgement calls, not an audit and not regulated advice.',
     ],
     durationMs: Date.now() - started,
   }
