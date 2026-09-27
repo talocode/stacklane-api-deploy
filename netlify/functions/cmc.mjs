@@ -184,7 +184,10 @@ export async function verifyTokenIdentity(input = {}, deps = {}) {
   let upstreamCredits = null
   let upstreamError = null
 
-  if (!cmcConfigured()) {
+  // Only a keyword query needs the market-data provider. An address query is served
+  // by the Solana source, so requiring this key for it would fail a request that has
+  // everything it needs.
+  if (!address && !cmcConfigured()) {
     findings.push({
       id: 'token.not_configured',
       rule: 'token.not_configured',
