@@ -24,6 +24,11 @@ const SECRET_PATTERNS = [
   { id: 'secret.slack', re: /xox[baprs]-[0-9A-Za-z-]{10,}/g, message: 'Slack token pattern', severity: 'critical' },
   { id: 'secret.github_pat', re: /ghp_[A-Za-z0-9]{36}/g, message: 'GitHub personal access token', severity: 'critical' },
   { id: 'secret.openai', re: /sk-[A-Za-z0-9]{20,}/g, message: 'OpenAI-style secret key', severity: 'high' },
+  // Payment keys move real money, so they outrank the generic api-key rule and must
+  // not be missed. Both live prefixes are covered: the full secret key and the
+  // restricted key, which is narrower but still spendable within its scopes.
+  { id: 'secret.stripe_live', re: /sk_live_[0-9a-zA-Z]{20,}/g, message: 'Stripe live secret key (charges real cards)', severity: 'critical' },
+  { id: 'secret.stripe_restricted', re: /rk_live_[0-9a-zA-Z]{20,}/g, message: 'Stripe restricted live key', severity: 'high' },
 ]
 
 const SECURITY_PATTERNS = [
