@@ -5,11 +5,12 @@
 
 [functions]
   node_bundler = "esbuild"
-external_node_modules = ["@netlify/blobs"]
+  external_node_modules = ["@netlify/blobs"]
 
 [functions.api]
   maxDuration = 26
 
+# TokenLane hosted routes live in netlify/functions/api.mjs + tokenlane-engine.mjs
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/api/:splat"
