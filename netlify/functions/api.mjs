@@ -797,6 +797,11 @@ const MCP_TOOLS = [
   { name: "searchlane_query", description: "Agent web search. Returns ranked structured hits (title, url, snippet, score). Uses Brave/Serper if keys set, else DuckDuckGo. 5 credits." },
   { name: "searchlane_news", description: "News/freshness-biased search for agents. Returns structured news-oriented hits. 8 credits." },
   { name: "searchlane_research", description: "Deep research: multi-source search + extractive brief with citations. Best for agent research steps. 30 credits." },
+  { name: "loop_health", description: "Check the Talocode loop API. Free." },
+  { name: "loop_pricing", description: "Loop pricing: 1 credit for each public source that loads. A failed fetch is free." },
+  { name: "loop_capabilities", description: "List loop endpoints: run and brief. Free." },
+  { name: "loop_run", description: "Fetch one public https page, check whether the claim is in it, and return a receipt. 1 credit only if the page loads." },
+  { name: "loop_brief", description: "Fetch up to 5 public https pages. recommendation is do_not_ship when any source fails. 1 credit per page that loads." },
   { name: "calclane_health", description: "Check CalcLane calculator API health and endpoints. Free." },
   { name: "calclane_pricing", description: "Get CalcLane credit pricing: evaluate 1, dispatch 1. Free." },
   { name: "calclane_capabilities", description: "List CalcLane modes, features, and HTTP endpoints. Free." },
@@ -956,6 +961,9 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
         },
         searchlane: {
           'searchlane.query': 5, 'searchlane.news': 8, 'searchlane.research': 30,
+        },
+        loop: {
+          'loop.run': 1, 'loop.brief': 1,
         },
         calclane: {
           'calclane.evaluate': 1, 'calclane.dispatch': 1,
@@ -2561,6 +2569,49 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
       }
     }
     return e(404, 'not_found', `SearchLane route not found: ${method} ${path}`)
+  }
+
+  // ── Loop (search, verify, trace, remember) ───────────────────────
+  if (path.startsWith('/v1/loop/')) {
+    const sub = path.replace('/v1/loop', '')
+    const { runHostedLoop, runHostedBrief, getLoopPricing, getLoopCapabilities, LOOP_VERSION } = await import('./loop-engine.mjs')
+    if (method === 'GET' && (sub === '/health' || sub === '' || sub === '/')) {
+      return r(200, { ok: true, service: 'loop', version: LOOP_VERSION, endpoints: getLoopCapabilities().endpoints, meta: { requestId } })
+    }
+    if (method === 'GET' && sub === '/pricing') return r(200, { ...getLoopPricing(), meta: { requestId } })
+    if (method === 'GET' && sub === '/capabilities') return r(200, { ...getLoopCapabilities(), meta: { requestId } })
+    if (method === 'POST' && (sub === '/run' || sub === '/brief')) {
+      const payload = jsonBody(body) || {}
+      const auth = await requireApiKey(headers)
+      if (!auth.ok) return e(auth.status, auth.code, auth.message)
+      const db = await loadDb()
+      const keyInfo = await findKeyEntry(db, auth.key)
+      const userId = keyInfo.userId || auth.userId
+      const wallet = resolveWallet(db, userId)
+      const balance = wallet ? (wallet.balance || 0) : (db.profiles?.[userId]?.purchased_credits_balance || 0)
+      const requested = sub === '/run' ? 1 : Math.min(5, (Array.isArray(payload.urls) ? payload.urls.length : payload.url ? 1 : 0) || 1)
+      if (balance < requested) {
+        return e(402, 'insufficient_credits', `Insufficient credits. Required: ${requested}, Balance: ${balance}`)
+      }
+      let receipt
+      try {
+        receipt = sub === '/run'
+          ? await runHostedLoop({ query: payload.query, url: payload.url, claim: payload.claim })
+          : await runHostedBrief({
+              question: payload.question || payload.query,
+              urls: Array.isArray(payload.urls) ? payload.urls : payload.url ? [payload.url] : [],
+            })
+      } catch (error) {
+        return e(422, 'validation_error', error.message || 'Loop request was rejected')
+      }
+      if (!receipt.credits) {
+        return r(receipt.ok ? 200 : 422, { ...receipt, usage: { credits: 0, remaining: null }, meta: { requestId } })
+      }
+      const charged = await chargeCredits(headers, 'loop', sub === '/run' ? 'loop.run' : 'loop.brief', receipt.credits, requestId, { loaded: receipt.loaded })
+      if (!charged.ok) return e(charged.status, charged.code, charged.message)
+      return r(receipt.ok ? 200 : 422, { ...receipt, usage: { credits: receipt.credits, action: sub === '/run' ? 'loop.run' : 'loop.brief', remaining: charged.remaining }, meta: { requestId } })
+    }
+    return e(404, 'not_found', `Loop route not found: ${method} ${path}`)
   }
 
 
