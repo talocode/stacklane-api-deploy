@@ -6,6 +6,7 @@ export { CREDITS_PER_USD }
 export const TCODE_MINT = '6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory'
 export const CHALLENGE_TTL_MS = 5 * 60 * 1000
 export const DEFAULT_RPC_URL = 'https://api.mainnet-beta.solana.com'
+const RPC_FALLBACKS = [DEFAULT_RPC_URL]
 
 export const TCODE_TIERS = [
   { key: 'explorer', minTokens: 1, monthlyCredits: 1000 },
@@ -241,20 +242,33 @@ export function publicConfig() {
   }
 }
 
+function rpcCandidates(rpcUrl) {
+  const list = []
+  for (const url of [rpcUrl, ...RPC_FALLBACKS]) {
+    if (url && !list.includes(url)) list.push(url)
+  }
+  return list
+}
+
 async function rpcCall(rpcUrl, method, params, fetchImpl = fetch) {
-  const response = await fetchImpl(rpcUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  })
-  if (!response.ok) {
-    throw new TcodeError(503, 'rpc_unavailable', 'Could not read $TCODE holdings from chain')
+  let lastError = new TcodeError(503, 'rpc_unavailable', 'Could not read $TCODE holdings from chain')
+  for (const url of rpcCandidates(rpcUrl)) {
+    try {
+      const response = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!response.ok) continue
+      const payload = await response.json()
+      if (payload.error) continue
+      return payload.result
+    } catch (error) {
+      if (error instanceof TcodeError) lastError = error
+    }
   }
-  const payload = await response.json()
-  if (payload.error) {
-    throw new TcodeError(503, 'rpc_unavailable', 'Could not read $TCODE holdings from chain')
-  }
-  return payload.result
+  throw lastError
 }
 
 const decimalsCache = { value: null, at: 0 }

@@ -1,7 +1,7 @@
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto'
 import fs from 'node:fs'
 import pg from 'pg'
-import { createTcodeStore, publicConfig as tcodePublicConfig, TcodeError, TCODE_SCHEMA_SQL, TCODE_MINT, fetchTcodeUsdPrice } from './tcode.mjs'
+import { createTcodeStore, publicConfig as tcodePublicConfig, TcodeError, TCODE_SCHEMA_SQL, TCODE_MINT, fetchTcodeUsdPrice, fetchMintDecimals } from './tcode.mjs'
 import { CREDITS_PER_USD, getCreditPack, lemonSqueezyVariantFor, fiatCheckoutConfigured } from './credit-packs.mjs'
 import { dispatchTool, listAdvertisedTools, toolRegistrySummary } from './mcp-dispatch.mjs'
 
@@ -2165,6 +2165,15 @@ async function routeHandler(method, rawPath, headers, body, queryParams) {
 
   if (method === 'GET' && path === '/api/v1/cloud/tcode') {
     return r(200, { ok: true, request_id: requestId, data: tcodePublicConfig() }, requestId)
+  }
+
+  if (method === 'GET' && path === '/api/v1/cloud/tcode/rpc') {
+    try {
+      const decimals = await fetchMintDecimals(process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com')
+      return r(200, { ok: true, request_id: requestId, data: { decimals } }, requestId)
+    } catch (error) {
+      return tcodeFail(error, e, requestId)
+    }
   }
 
   if (method === 'POST' && path === '/api/v1/cloud/tcode/challenge') {
