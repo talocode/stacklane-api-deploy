@@ -74,6 +74,7 @@ Hosted tools on `https://api.talocode.site/mcp`, with the same API key:
 | `loop_capabilities` | free |
 | `loop_run` | 1 if the page loads |
 | `loop_brief` | 1 per page that loads, maximum 5 |
+| `loop_audit` | 1 if the page loads, up to 8 claims |
 
 ## Hosted API
 
@@ -86,6 +87,7 @@ Base URL: `https://api.talocode.site`
 | GET | `/v1/loop/capabilities` | no | 0 |
 | POST | `/v1/loop/run` | Bearer key | 1 if the page loads |
 | POST | `/v1/loop/brief` | Bearer key | 1 per page that loads |
+| POST | `/v1/loop/audit` | Bearer key | 1 if the page loads, up to 8 claims |
 
 ```bash
 curl -s https://api.talocode.site/v1/loop/run \
@@ -94,7 +96,16 @@ curl -s https://api.talocode.site/v1/loop/run \
   -d '{"query":"Talocode official mint","url":"https://talocode.site/llms.txt","claim":"6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory"}'
 ```
 
-The hosted route accepts public `https` URLs only. It refuses localhost, private addresses, and link-local addresses. Page text is not returned. The receipt has the status, up to eight matching lines, and whether the claim was present.
+The hosted route accepts public `https` URLs only. It refuses localhost, private addresses, and link-local addresses. Page text is not returned. A run receipt has the status, up to eight matching lines, whether the claim was present, and the line that contained it.
+
+`/v1/loop/audit` loads the page once and checks every claim you send, up to 8. That is still one credit. A claim that is absent stays in the receipt with `found: false`. It does not get a second fetch.
+
+```bash
+curl -s https://api.talocode.site/v1/loop/audit \
+  -H "authorization: Bearer $TALOCODE_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"query":"Talocode token facts","url":"https://talocode.site/llms.txt","claims":["6ptxwABxQz8zMhwhiPeVgRgWjGMdVcEBFBv8v8C3ory","500,000 TCODE fixed","unlimited supply"]}'
+```
 
 `usage.credits` is `0` when nothing loaded. `usage.remaining` is the balance after a charge.
 

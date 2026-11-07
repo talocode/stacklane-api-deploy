@@ -109,6 +109,7 @@ export const TOOL_ROUTES = {
   loop_capabilities: { route: '/v1/loop/capabilities', method: 'GET' },
   loop_run: { route: '/v1/loop/run', method: 'POST' },
   loop_brief: { route: '/v1/loop/brief', method: 'POST' },
+  loop_audit: { route: '/v1/loop/audit', method: 'POST' },
   signallane_x_analyze: { route: '/v1/signallane/x/analyze', method: 'POST' },
   signallane_x_content_plan: { route: '/v1/signallane/x/content-plan', method: 'POST' },
   signallane_x_experiments: { route: '/v1/signallane/x/experiments', method: 'POST' },
