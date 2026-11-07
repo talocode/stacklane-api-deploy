@@ -89,6 +89,11 @@ export async function runHostedLoop({ query, url, claim }) {
   const matches = source.text.split('\n').filter((line) => words.some((word) => line.toLowerCase().includes(word.toLowerCase()))).slice(0, 8)
   const found = source.ok && source.text.includes(claim)
   const loaded = source.ok ? 1 : 0
+  const summary = !source.ok
+    ? 'The page did not load. No credit.'
+    : found
+      ? 'The page loaded and the claim was in it. One credit.'
+      : 'The page loaded. The claim was not in it. One credit.'
   return {
     ok: found,
     product: '@talocode/loop',
@@ -97,6 +102,7 @@ export async function runHostedLoop({ query, url, claim }) {
     url: source.url,
     loaded,
     credits: creditsForLoaded(loaded),
+    summary,
     steps: [
       { name: 'search', ok: source.ok, status: source.status, ms: source.ms, matches, error: source.error },
       { name: 'verify', ok: found, claim, found, error: found ? null : 'claim not present in searched source' },
@@ -118,6 +124,9 @@ export async function runHostedBrief({ question, urls }) {
   }
   const failed = sources.filter((source) => !source.ok)
   const loaded = sources.length - failed.length
+  const summary = failed.length
+    ? `${loaded} of ${sources.length} sources loaded. Recommendation: do not ship. No missing source is treated as agreement.`
+    : `${loaded} of ${sources.length} sources loaded. Recommendation: review. This is not a decision to ship.`
   return {
     ok: failed.length === 0,
     product: '@talocode/loop',
@@ -127,6 +136,7 @@ export async function runHostedBrief({ question, urls }) {
     reason: failed.length
       ? 'At least one named source failed. A missing source is not treated as agreement.'
       : 'Every named source responded. This is a review queue, not a decision to ship.',
+    summary,
     loaded,
     credits: creditsForLoaded(loaded),
     sources,
