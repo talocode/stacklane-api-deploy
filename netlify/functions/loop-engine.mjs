@@ -1,4 +1,4 @@
-export const LOOP_VERSION = '0.3.0'
+export const LOOP_VERSION = '0.3.1'
 export const LOOP_CREDIT = 1
 const MAX_SOURCES = 5
 const MAX_CLAIMS = 8
@@ -106,18 +106,48 @@ export function judgeClaims(text, claims) {
   }))
 }
 
+export function httpsUrlsIn(claim) {
+  const matches = String(claim || '').match(/https:\/\/[^\s<>"')\]]+/g) || []
+  return [...new Set(matches.map((url) => url.replace(/[.,;]+$/g, '')))].slice(0, 2)
+}
+
+export async function openClaimUrls(results) {
+  const checked = []
+  for (const row of results) {
+    const urls = row.found ? httpsUrlsIn(row.claim) : []
+    if (!urls.length) {
+      checked.push({ ...row, opens: null, links: [] })
+      continue
+    }
+    const links = []
+    for (const url of urls) {
+      try {
+        assertPublicHttps(url)
+        const source = await fetchPublic(url, 6000)
+        links.push({ url: source.url, opens: source.ok, status: source.status, error: source.error })
+      } catch (error) {
+        links.push({ url, opens: false, status: 0, error: error?.message || 'fetch failed' })
+      }
+    }
+    checked.push({ ...row, opens: links.every((link) => link.opens), links })
+  }
+  return checked
+}
+
 export function summarizeAudit({ loaded, results }) {
   const total = results.length
   const foundCount = results.filter((row) => row.found).length
+  const closed = results.filter((row) => row.opens === false).length
+  const closedNote = closed ? ` ${closed} linked address${closed === 1 ? '' : 'es'} did not open.` : ''
   if (!loaded) return 'The page did not load. No credit.'
   if (total === 1) {
     return foundCount
-      ? 'The page loaded and the claim was in it. One credit.'
+      ? `The page loaded and the claim was in it.${closedNote} One credit.`
       : 'The page loaded. The claim was not in it. One credit.'
   }
-  if (foundCount === total) return `The page loaded. All ${total} claims were in it. One credit.`
+  if (foundCount === total) return `The page loaded. All ${total} claims were in it.${closedNote} One credit.`
   if (foundCount === 0) return `The page loaded. None of the ${total} claims were in it. One credit.`
-  return `The page loaded. ${foundCount} of ${total} claims were in it. One credit.`
+  return `The page loaded. ${foundCount} of ${total} claims were in it.${closedNote} One credit.`
 }
 
 export async function runHostedLoop({ query, url, claim }) {
@@ -161,13 +191,14 @@ export async function runHostedAudit({ query, url, claims }) {
   const source = await fetchPublic(url)
   const words = query.split(/\s+/).filter((word) => word.length > 3)
   const matches = source.text.split('\n').filter((line) => words.some((word) => line.toLowerCase().includes(word.toLowerCase()))).slice(0, 8)
-  const results = judgeClaims(source.ok ? source.text : '', list).map((row) => (
+  const results = await openClaimUrls(judgeClaims(source.ok ? source.text : '', list).map((row) => (
     source.ok ? row : { claim: row.claim, found: false, excerpt: null }
-  ))
+  )))
   const foundCount = results.filter((row) => row.found).length
+  const closed = results.some((row) => row.opens === false)
   const loaded = source.ok ? 1 : 0
   return {
-    ok: Boolean(loaded) && foundCount === results.length,
+    ok: Boolean(loaded) && foundCount === results.length && !closed,
     product: '@talocode/loop',
     version: LOOP_VERSION,
     query,
@@ -180,8 +211,8 @@ export async function runHostedAudit({ query, url, claims }) {
     claims: results,
     steps: [
       { name: 'search', ok: source.ok, status: source.status, ms: source.ms, matches, error: source.error },
-      { name: 'verify', ok: foundCount === results.length, checked: results.length, found: foundCount },
-      { name: 'trace', ok: source.ok && foundCount === results.length },
+      { name: 'verify', ok: foundCount === results.length && !closed, checked: results.length, found: foundCount },
+      { name: 'trace', ok: source.ok && foundCount === results.length && !closed },
       { name: 'remember', ok: true, stored: 'receipt' },
     ],
   }
@@ -225,7 +256,7 @@ export function getLoopPricing() {
     credits: {
       'loop.run': '1 per source that loads. A failed fetch is free.',
       'loop.brief': '1 per source that loads, up to 5. A failed fetch is free.',
-      'loop.audit': '1 per page that loads, for up to 8 claims. A failed fetch is free.',
+      'loop.audit': '1 per page that loads, for up to 8 claims. An https claim is also opened. A failed fetch is free.',
     },
   }
 }
@@ -234,7 +265,7 @@ export function getLoopCapabilities() {
   return {
     service: 'loop',
     version: LOOP_VERSION,
-    summary: 'Search one public page and check up to 8 claims against that single load. One credit if the page loads.',
+    summary: 'Search one public page and check up to 8 claims against that single load. An https claim is also opened. One credit if the page loads.',
     endpoints: ['/v1/loop/health', '/v1/loop/pricing', '/v1/loop/capabilities', '/v1/loop/run', '/v1/loop/brief', '/v1/loop/audit'],
   }
 }
